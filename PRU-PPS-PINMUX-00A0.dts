@@ -1,0 +1,27 @@
+/dts-v1/;
+/plugin/;
+
+/ {
+    compatible = "ti,beaglebone", "ti,beaglebone-black";
+    part-number = "PRU-PPS-PINMUX";
+    version = "00A0";
+
+    fragment@0 {
+        target = <&am33xx_pinmux>;
+        __overlay__ {
+            pinmux_pru_pps_pin: pinmux_pru_pps_pin {
+                /* P8_16: offset 0x38, mode 6 = pr1_pru0_pru_r31_14
+                   0x36 = mode6 | INPUT_EN | PULL_DISABLE */
+                pinctrl-single,pins = <0x38 0x36>;
+            };
+        };
+    };
+
+    fragment@1 {
+        target = <&pru0>;
+        __overlay__ {
+            pinctrl-names = "default";
+            pinctrl-0 = <&pinmux_pru_pps_pin>;
+        };
+    };
+};

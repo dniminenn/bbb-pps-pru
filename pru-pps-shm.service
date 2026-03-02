@@ -1,0 +1,21 @@
+[Unit]
+Description=PRU PPS to Chrony SHM feeder
+After=network.target
+Before=chrony.service
+Requires=sys-class-remoteproc-remoteproc1.device
+
+[Service]
+Type=simple
+# Boot PRU0 via remoteproc before starting
+ExecStartPre=/bin/sh -c 'echo start > /sys/class/remoteproc/remoteproc1/state 2>/dev/null || true'
+ExecStartPre=/bin/sleep 3
+ExecStart=/usr/local/bin/pru_pps_shm -s 2
+Restart=on-failure
+RestartSec=5
+Nice=-20
+CPUSchedulingPolicy=fifo
+CPUSchedulingPriority=50
+MemoryLock=yes
+
+[Install]
+WantedBy=multi-user.target
