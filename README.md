@@ -5,7 +5,7 @@ A complete guide to implementing a PRU-based hardware-timestamped PPS source on 
 ```
   PRU-ICSS (edge capture)              Linux (servo / policy)
  ┌──────────────────────────┐    ┌───────────────────────────────┐
- │ GPS PPS → P8_16 → R31   │    │ pru_pps_shm (SCHED_FIFO:50)  │
+ │ GPS PPS → P8_16 → R31    │    │ pru_pps_shm (SCHED_FIFO:50)   │
  │ PRU0 polls rising edge   ├───►│ IEP↔wall calibration          │
  │ IEP latch (200 MHz)      │    │ NTP SHM unit 2                │
  │ DRAM0: { seq, iep_lo }   │    │ Chrony refclock → adjtimex    │
