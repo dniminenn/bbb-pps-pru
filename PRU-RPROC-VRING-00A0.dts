@@ -1,0 +1,26 @@
+/dts-v1/;
+/plugin/;
+
+/ {
+    compatible = "ti,beaglebone", "ti,beaglebone-black";
+    part-number = "PRU-RPROC-VRING";
+    version = "00A0";
+
+    fragment@0 {
+        target = <&pru0>;
+        __overlay__ {
+            interrupt-parent = <&pruss_intc>;
+            interrupts = <16 2 2>, <17 0 0>;
+            interrupt-names = "vring", "kick";
+        };
+    };
+
+    fragment@1 {
+        target = <&pru1>;
+        __overlay__ {
+            interrupt-parent = <&pruss_intc>;
+            interrupts = <18 3 3>, <19 1 1>;
+            interrupt-names = "vring", "kick";
+        };
+    };
+};

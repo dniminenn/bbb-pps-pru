@@ -130,10 +130,20 @@ dtc -O dtb -o /lib/firmware/PRU-PPS-PINMUX-00A0.dtbo -b 0 -@ PRU-PPS-PINMUX-00A0
 
 ### PRU-RPROC-VRING-00A0.dtbo
 
-This overlay wires the PRU0/PRU1 interrupt lines for rpmsg/vring communication. Use the pre-built overlay from the BeagleBone Debian firmware package — it configures:
+This overlay wires the PRU0/PRU1 interrupt lines for rpmsg/vring communication:
 
-- PRU0: `vring` (sysevt 16), `kick` (sysevt 17)
-- PRU1: `vring` (sysevt 18), `kick` (sysevt 19)
+- PRU0: `vring` (sysevt 16, ch 2, host 2), `kick` (sysevt 17, ch 0, host 0)
+- PRU1: `vring` (sysevt 18, ch 3, host 3), `kick` (sysevt 19, ch 1, host 1)
+
+```dts
+/* See PRU-RPROC-VRING-00A0.dts */
+```
+
+Compile and install:
+
+```bash
+dtc -O dtb -o /lib/firmware/PRU-RPROC-VRING-00A0.dtbo -b 0 -@ PRU-RPROC-VRING-00A0.dts
+```
 
 ---
 
@@ -247,6 +257,12 @@ The NTP SHM struct uses 64-bit `time_t` (Y2038-safe on this Debian Trixie system
 | 60 | `receiveTimeStampNSec` (uint32) | Sub-second ns |
 
 Chrony uses `clockTS - receiveTS` as its raw offset sample, so `receiveTimeStamp` must be the best available wall-clock estimate of the actual edge time — not rounded.
+
+### Full Source: pru_pps_shm.c
+
+```c
+/* See pru_pps_shm.c */
+```
 
 ### Compile and Install
 
