@@ -1,0 +1,13 @@
+direction: down
+
+pru: "PRU-ICSS\nGPS PPS captured by PRU0\nlatched on the 200 MHz IEP timer" {
+  style.font-size: 16
+}
+
+linux: "Linux\npru_pps_shm to chrony (NTP SHM)\nservo disciplines the system clock" {
+  style.font-size: 16
+}
+
+pru -> linux: "/dev/mem" {
+  style.font-size: 14
+}

@@ -1,5 +1,10 @@
 # Measurements & Validation
 
+This document covers the clock's **internal precision**: how tightly it holds against
+its own PPS and servo (offset, jitter, tracking stats). For **external accuracy**, how
+closely it agrees with a separate, independent GPS reference over PTP, see
+[CROSS-VALIDATION.md](../CROSS-VALIDATION.md).
+
 ## Expected performance
 
 | Metric | PRU PPS (this project) | GPIO PPS (`pps-gpio`) |

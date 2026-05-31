@@ -1,0 +1,20 @@
+direction: down
+
+gm: "Grandmaster .24\nGPS PPS on i210 SDP0 (hardware extts)\nts2phc disciplines the PHC" {
+  style.font-size: 16
+}
+
+bbb: "BeagleBone .23\nGPS / PRU drives the system clock\nCPTS mirrors it; ptp4l measures only" {
+  style.font-size: 16
+}
+
+result: "offsetFromMaster = .23 minus .24 GPS" {
+  style.font-size: 16
+}
+
+gm -> bbb: "L2 PTP" {
+  style.font-size: 14
+}
+bbb -> result {
+  style.font-size: 14
+}

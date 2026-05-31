@@ -1,0 +1,24 @@
+cff-version: 1.2.0
+message: "If you use this work, please cite it using these metadata."
+title: "PRU PPS: nanosecond-precision GPS Stratum 1 timekeeping on the BeagleBone Black"
+abstract: >-
+  BeagleBone Black PRU-based GPS pulse-per-second hardware timestamping feeding chrony
+  via shared memory, achieving low-nanosecond clock offsets by bypassing the Linux GPIO
+  interrupt path, with PTP cross-validation against an independent GPS grandmaster.
+type: software
+authors:
+  - name: dniminenn
+repository-code: "https://github.com/dniminenn/bbs-pps-pru"
+url: "https://github.com/dniminenn/bbs-pps-pru"
+license: MIT-0
+keywords:
+  - NTP
+  - PTP
+  - GPS
+  - PPS
+  - "stratum 1"
+  - "BeagleBone Black"
+  - PRU
+  - chrony
+  - "hardware timestamping"
+  - timekeeping

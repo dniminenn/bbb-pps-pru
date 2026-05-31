@@ -16,36 +16,7 @@ This approach uses **PRU0** to timestamp the PPS edge directly using the IEP (In
 
 ## Architecture
 
-```
- ┌──────────────────────────────────────────────────────────────┐
- │  PRU-ICSS  (edge capture / phase detector)                   │
- │                                                              │
- │   GPS PPS ──► P8_16 (pr1_pru0_pru_r31_14)                    │
- │                     │                                        │
- │              PRU0 polls R31 in tight loop (rising edge)      │
- │                     │                                        │
- │              IEP counter latch (200 MHz, 5 ns/tick)          │
- │                     │                                        │
- │              PRU DRAM0 @ 0x4A300000                          │
- │              struct { seq, iep_lo }    ◄─── raw IEP ticks    │
- └─────────────────────┬────────────────────────────────────────┘
-                       │  /dev/mem mmap (read-only)
- ┌─────────────────────▼────────────────────────────────────────┐
- │  Linux  (clock-domain crossing + servo / policy)             │
- │                                                              │
- │   pru_pps_shm  (SCHED_FIFO:50)                               │
- │      ├── IEP ↔ wall calibration (10-sample tight bracket)    │
- │      ├── ns/tick IIR filter (tracks thermal drift)           │
- │      └── projects PPS edge to CLOCK_REALTIME                 │
- │                     │                                        │
- │              NTP SHM unit 2 (mode-1 handshake)               │
- │                     │                                        │
- │              Chrony refclock SHM 2                           │
- │              (PPS, precision 1e-9, lock GPS)                 │
- │                     │                                        │
- │              System clock disciplined via adjtimex           │
- └──────────────────────────────────────────────────────────────┘
-```
+<img src="../diagrams/architecture.svg" width="340" alt="PRU PPS architecture: PRU edge capture into the Linux servo path">
 
 ### Component roles
 

@@ -44,6 +44,87 @@ chronyc sources -v
 
 ---
 
+## Common Failure Modes
+
+### gpsd silently stops feeding the coarse time, and the clock coasts
+
+Symptom: `chronyc tracking` shows the reference time frozen minutes or hours in the
+past, root dispersion climbing into the milliseconds, and the system clock slowly
+drifting. From another host this server looks like a falseticker and gets dropped.
+The PRU PPS daemon looks completely healthy the whole time.
+
+Cause: the PPS refclock is `lock GPS`, so it needs the coarse second from gpsd
+(SHM unit 0, refid `GPS`) to know which second each pulse belongs to. gpsd can stop
+publishing SHM unit 0 while the gpsd process stays alive and still holds a fix, so a
+normal systemd `Restart=` policy never triggers. With unit 0 dead, chrony discards
+the good PPS and free-runs.
+
+Diagnose:
+
+```bash
+# Only NTP2 (PRU PPS) updates; NTP0 (gpsd coarse) is silent:
+sudo ntpshmmon
+
+# The GPS refclock shows reach 0 with an old last-sample time:
+chronyc -n sources        # look at the "GPS" line, Reach column
+```
+
+Fix now:
+
+```bash
+sudo systemctl restart gpsd gpsd.socket   # chrony relocks PPS within a few polls
+```
+
+Prevent it (auto-recovery): a small output-liveness watchdog restarts gpsd when the
+GPS refclock actually goes stale. SHM unit 0 is written only by gpsd, so a reach-0
+`GPS` refclock is unambiguously a gpsd fault. The double read 12 s apart avoids
+false-firing during the normal reach rebuild right after gpsd starts.
+
+`/usr/local/sbin/gps-refclock-watchdog.sh`:
+
+```bash
+#!/usr/bin/env bash
+set -u
+gps_reach() { chronyc -n sources 2>/dev/null | awk '$2=="GPS"{print $5}'; }
+r1=$(gps_reach); [ "${r1:-x}" = "0" ] || exit 0   # healthy, rebuilding, or chrony down
+sleep 12
+r2=$(gps_reach); [ "${r2:-x}" = "0" ] || exit 0   # cleared on its own (post-restart blip)
+logger -t gps-refclock-watchdog "GPS refclock (gpsd NTP0) reach=0 for >12s; restarting gpsd"
+systemctl restart gpsd gpsd.socket
+```
+
+Run it every 2 minutes with a systemd timer:
+
+```ini
+# /etc/systemd/system/gps-refclock-watchdog.service
+[Unit]
+Description=Restart gpsd if the chrony GPS refclock (SHM NTP0) goes stale
+After=chrony.service gpsd.service
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/gps-refclock-watchdog.sh
+
+# /etc/systemd/system/gps-refclock-watchdog.timer
+[Unit]
+Description=Run the GPS refclock watchdog every 2 minutes
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec=2min
+AccuracySec=10s
+[Install]
+WantedBy=timers.target
+```
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now gps-refclock-watchdog.timer
+```
+
+Unattended recovery lands in 1 to 3 minutes (time for reach to decay to 0 plus one
+timer interval), which chrony rides out on holdover.
+
+---
+
 ## Remoteproc Map
 
 | remoteproc | PRU | Physical | Firmware |

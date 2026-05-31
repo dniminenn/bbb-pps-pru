@@ -1,0 +1,12 @@
+[Unit]
+Description=Set RT priorities for PPS timing stability
+After=chrony.service chrony-exporter.service
+Wants=chrony.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/bin/pps-rtprio.sh
+
+[Install]
+WantedBy=multi-user.target

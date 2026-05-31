@@ -1,0 +1,13 @@
+direction: down
+
+pru: "PRU-ICSS (edge capture)\nGPS PPS on P8_16, PRU0 polls R31\nIEP latch (200 MHz, 5 ns/tick)\nDRAM0 ring: seq, iep_lo" {
+  style.font-size: 16
+}
+
+linux: "Linux (servo / policy)\npru_pps_shm (SCHED_FIFO:50)\nIEP to wall cal, ns/tick IIR\nNTP SHM 2 to chrony, adjtimex" {
+  style.font-size: 16
+}
+
+pru -> linux: "/dev/mem mmap" {
+  style.font-size: 14
+}
