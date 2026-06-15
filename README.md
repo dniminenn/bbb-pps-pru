@@ -1,5 +1,7 @@
 # PRU PPS: a nanosecond-precision GPS Stratum 1 clock on the BeagleBone Black
 
+**Writeup:** [BeagleBone PRU PPS timestamping for precise GPS time](https://dnim.dev/blog/bbb-pru-pps-timestamping)
+
 Turn a BeagleBone Black and a GPS module with a PPS output into a **Stratum 1 NTP
 server** whose time is disciplined to **nanoseconds**, by capturing the GPS
 pulse-per-second edge in **PRU hardware** instead of through a Linux GPIO interrupt.
