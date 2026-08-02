@@ -1,0 +1,40 @@
+/dts-v1/;
+/plugin/;
+
+/ {
+    compatible = "ti,beaglebone", "ti,beaglebone-black";
+    part-number = "PRU-PPS-ECAP";
+    version = "00A0";
+
+    fragment@0 {
+        target = <&am33xx_pinmux>;
+        __overlay__ {
+            pinmux_pru_pps_ecap_pins: pinmux_pru_pps_ecap_pins {
+                pinctrl-single,pins = <
+                    /* P8_15: offset 0x3c, mode 5 = pr1_ecap0_ecap_capin
+                       GPS PPS captured in eCAP hardware (CAP1, rising).
+                       0x35 = mode5 | INPUT_EN | pull-up */
+                    0x3c 0x35
+                    /* P9_41A: offset 0x1b4, mode 5 = pr1_pru0_pru_r31_16
+                       DS3231 32kHz TCXO output (open drain — the internal
+                       ~27k pull-up carries it; PRU0 counts FALLING edges,
+                       which the RTC drives hard, so the slow pulled rise
+                       never matters). 0x35 = mode5 | INPUT_EN | pull-up */
+                    0x1b4 0x35
+                    /* P9_41B companion pad (mcasp0_axr1): same header pin,
+                       park it as a plain input so it can't contend.
+                       0x2f = mode7 (gpio in) | INPUT_EN | pull disabled */
+                    0x1a8 0x2f
+                >;
+            };
+        };
+    };
+
+    fragment@1 {
+        target = <&pru0>;
+        __overlay__ {
+            pinctrl-names = "default";
+            pinctrl-0 = <&pinmux_pru_pps_ecap_pins>;
+        };
+    };
+};

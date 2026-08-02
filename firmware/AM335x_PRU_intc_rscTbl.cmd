@@ -66,6 +66,7 @@ SECTIONS {
         .fardata        >  PRU_DMEM_0_1, PAGE 1
 
         .pps_dram       >  0x0, PAGE 1
+        .tcxo_dram      >  0x10, PAGE 1
         .resource_table >  PRU_DMEM_0_1, PAGE 1
 
         .pru_irq_map (COPY) :

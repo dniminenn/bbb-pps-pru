@@ -90,8 +90,23 @@ static struct shmTime *shm_get(int unit) {
 }
 
 #define PRU_DRAM0_BASE 0x4A300000
-#define IEP_BASE 0x4A32E000
+#define TCXO_OFFSET 0x10     /* tcxo_shared follows pps_shared in PRU0 DRAM */
+#define ECAP_BASE 0x4A330000 /* ICSS eCAP: TSCTR at 0, CAP1 latches PPS */
 #define RPMSG_DEV "/dev/rpmsg_pru30"
+
+/*
+ * TCXO reference (optional): PRU0 also counts the DS3231's 32.768 kHz output
+ * (P9_41A) and snapshots {edges, TSCTR} every 4096 edges. Consecutive
+ * snapshots give the 200 MHz timebase's frequency against a ±2 ppm
+ * temperature-compensated reference — a live crystal-drift measurement,
+ * independent of GPS. Purely observational for now (logged + written to
+ * /run/pps-tcxo-ppm); a frozen snapshot struct just disables it.
+ */
+struct tcxo_shared {
+  volatile uint32_t seq;
+  volatile uint32_t edges;
+  volatile uint32_t tsctr;
+};
 
 /*
  * IEP <-> CLOCK_REALTIME transfer model.
@@ -386,11 +401,13 @@ int main(int argc, char **argv) {
   }
 
   volatile uint32_t *iep = (volatile uint32_t *)mmap(
-      NULL, 0x1000, PROT_READ, MAP_SHARED, memfd, IEP_BASE);
+      NULL, 0x1000, PROT_READ, MAP_SHARED, memfd, ECAP_BASE);
   if (iep == MAP_FAILED) {
-    perror("mmap IEP");
+    perror("mmap ECAP");
     return 1;
   }
+  volatile struct tcxo_shared *tcxo =
+      (volatile struct tcxo_shared *)((volatile uint8_t *)pru + TCXO_OFFSET);
   close(memfd);
 
   struct shmTime *shm = shm_get(shmunit);
@@ -421,7 +438,7 @@ int main(int argc, char **argv) {
    * last committed read, which the 25 ms sampling cadence guarantees.
    */
   int64_t iep_ext = 0;
-  uint32_t iep_last_raw = iep[0x0C / 4];
+  uint32_t iep_last_raw = iep[0] /* eCAP TSCTR */;
   int step_strikes = 0;
 
   printf("pru_pps_shm: blocking on %s -> SHM unit %d (struct size=%zu, "
@@ -475,6 +492,65 @@ int main(int argc, char **argv) {
     }
 
     /*
+     * TCXO ratio bookkeeping: PRU1 publishes a new snapshot every 125 ms;
+     * accumulate extended TSCTR/edge counts and report the timebase's
+     * frequency against the DS3231 every ~60 s. Wrap-safe: consecutive
+     * snapshots are far inside the 21.5 s TSCTR wrap.
+     */
+    static uint32_t tq_seq = 0, tq_edges = 0, tq_tsctr = 0;
+    static int64_t tq_tsctr_ext = 0, tq_ref_ext = 0;
+    static uint64_t tq_edges_tot = 0, tq_ref_edges = 0;
+    static int tq_have = 0;
+    if (tcxo) {
+      uint32_t s1 = tcxo->seq;
+      if (s1 != tq_seq) {
+        uint32_t e = tcxo->edges, ts = tcxo->tsctr;
+        if (tcxo->seq == s1) { /* fields settled */
+          if (tq_have) {
+            tq_tsctr_ext += (int32_t)(ts - tq_tsctr);
+            tq_edges_tot += (uint32_t)(e - tq_edges);
+          } else {
+            tq_have = 1;
+            tq_ref_ext = tq_tsctr_ext;
+            tq_ref_edges = tq_edges_tot;
+          }
+          tq_seq = s1;
+          tq_edges = e;
+          tq_tsctr = ts;
+          if (tq_edges_tot - tq_ref_edges >= 32768ULL * 60) {
+            double sec_tcxo = (double)(tq_edges_tot - tq_ref_edges) / 32768.0;
+            double hz = (double)(tq_tsctr_ext - tq_ref_ext) / sec_tcxo;
+            double ppm = (hz / 200e6 - 1.0) * 1e6;
+            /*
+             * chrony's tempcomp rejects values beyond ±10 ppm, and rightly
+             * so — the servo/driftfile own the constant part of the crystal
+             * error. The TCXO contributes only the DEVIATION from the first
+             * window measured after daemon start; chrony re-absorbs the
+             * baseline into its drift estimate on every restart.
+             */
+            static double base_ppm;
+            static int have_base = 0;
+            if (!have_base) {
+              base_ppm = ppm;
+              have_base = 1;
+            }
+            printf("tcxo: timebase %+0.3f ppm vs DS3231, dev %+0.3f "
+                   "(%.0f s window)\n",
+                   ppm, ppm - base_ppm, sec_tcxo);
+            FILE *pf = fopen("/run/pps-tcxo-ppm.tmp", "w");
+            if (pf) {
+              fprintf(pf, "%.3f\n", ppm - base_ppm);
+              fclose(pf);
+              rename("/run/pps-tcxo-ppm.tmp", "/run/pps-tcxo-ppm");
+            }
+            tq_ref_ext = tq_tsctr_ext;
+            tq_ref_edges = tq_edges_tot;
+          }
+        }
+      }
+    }
+
+    /*
      * Calibration sandwich: bracket one IEP read with two REALTIME reads.
      * A single uncached OCP read brackets at 1.5-3 us on this A8; keep the
      * tightest of three so the accept rate stays high without loosening the
@@ -486,7 +562,7 @@ int main(int argc, char **argv) {
     uint32_t raw = 0;
     for (int k = 0; k < 3; k++) {
       clock_gettime(CLOCK_REALTIME, &t1);
-      uint32_t c = iep[0x0C / 4];
+      uint32_t c = iep[0] /* eCAP TSCTR */;
       clock_gettime(CLOCK_REALTIME, &t2);
       long long a = (long long)t1.tv_sec * 1000000000LL + t1.tv_nsec;
       long long b = (long long)t2.tv_sec * 1000000000LL + t2.tv_nsec;
