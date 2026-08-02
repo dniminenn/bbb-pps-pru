@@ -9,7 +9,7 @@ Type=simple
 # Boot PRU0 via remoteproc before starting
 ExecStartPre=/bin/sh -c 'echo start > /sys/class/remoteproc/remoteproc1/state 2>/dev/null || true'
 ExecStartPre=/bin/sleep 3
-ExecStart=/usr/local/bin/pru_pps_shm -s 2
+ExecStart=/usr/local/bin/pru_pps_shm -s 2 -q 1
 Restart=on-failure
 RestartSec=5
 Nice=-20

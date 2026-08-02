@@ -5,8 +5,12 @@
  * Copyright (c) 2026 dniminenn
  */
 
+#include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
+#include <math.h>
+#include <netinet/in.h>
 #include <poll.h>
 #include <sched.h>
 #include <signal.h>
@@ -17,6 +21,7 @@
 #include <sys/ipc.h>
 #include <sys/mman.h>
 #include <sys/shm.h>
+#include <sys/socket.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -88,12 +93,252 @@ static struct shmTime *shm_get(int unit) {
 #define IEP_BASE 0x4A32E000
 #define RPMSG_DEV "/dev/rpmsg_pru30"
 
+/*
+ * IEP <-> CLOCK_REALTIME transfer model.
+ *
+ * The original design took one min-spread calibration sandwich per pulse and
+ * projected the edge through it — the ±few-hundred-ns midpoint ambiguity of a
+ * single /dev/mem IEP read became the refclock's noise floor (~250 ns stddev
+ * observed at chrony). The IEP counter and the ARM timekeeping clocksource
+ * derive from the same 24 MHz master oscillator, so their relation is a line
+ * (temperature moves both together); we therefore sample the pair continuously
+ * and fit, shrinking the random sandwich noise by sqrt(N).
+ *
+ * CLOCK_REALTIME, however, is only piecewise-linear: chrony adjusts its slope
+ * every poll interval — partly in response to OUR samples. Evaluating a pulse
+ * against a trailing fit extrapolates across those slope kinks, and the
+ * daemon+chrony feedback loop rings at hundreds of ns (measured 300-900 ns
+ * scatter). So pulses are held for CAL_HALF_TICKS and evaluated against a
+ * window CENTERED on the edge — interpolation, where kink errors average out.
+ * The SHM sample lands ~2 s late, which chrony's SHM driver handles fine
+ * (receiveTimeStamp carries the sample's own epoch).
+ */
+#define CAL_WIN 512          /* ring capacity */
+#define CAL_INTERVAL_MS 25   /* sampling cadence between pulses */
+#define CAL_SPREAD_GATE_NS 2000
+#define CAL_STEP_GATE_NS 10000 /* residual beyond this = the clock stepped */
+#define CAL_MIN_SAMPLES 24
+/* ±0.5 s around the pulse. Wider windows average more but delay the sample —
+ * and that delay sits inside chrony's servo loop: at ±2 s chrony visibly
+ * hunted (±400 ns wander, skew x50). Fit residuals are ~8 ns, so a 40-sample
+ * window already evaluates the edge at the couple-ns level. */
+#define CAL_HALF_TICKS 100000000LL
+
+struct cal_sample {
+  int64_t iep;    /* extended (unwrapped) IEP ticks */
+  long long wall; /* CLOCK_REALTIME ns at that tick */
+};
+
+struct cal_fit {
+  int n;
+  double slope;         /* ns per tick */
+  double x0, y0;        /* centroid, relative to the int64 bases below */
+  int64_t iep_base;     /* rebasing anchors: doubles only ever hold small */
+  long long wall_base;  /* deltas, or a 2026 wall time truncates to 256 ns */
+  double rms;           /* residual RMS, ns */
+  int valid;
+};
+
+static struct cal_sample cal_ring[CAL_WIN];
+static int cal_head = 0, cal_count = 0;
+
+static void cal_reset(void) { cal_head = cal_count = 0; }
+
+static void cal_push(int64_t iep, long long wall) {
+  cal_ring[cal_head] = (struct cal_sample){iep, wall};
+  cal_head = (cal_head + 1) % CAL_WIN;
+  if (cal_count < CAL_WIN)
+    cal_count++;
+}
+
+/* Least-squares wall = f(iep) over samples within ±half_ticks of center. */
+static void cal_fit_window(struct cal_fit *f, int64_t center_iep,
+                           int64_t half_ticks) {
+  memset(f, 0, sizeof(*f));
+  if (cal_count < 2)
+    return;
+  int idx = (cal_head + CAL_WIN - cal_count) % CAL_WIN;
+  int64_t xb = center_iep;
+  long long yb = 0;
+  double sx = 0, sy = 0;
+  int n = 0;
+  for (int i = 0; i < cal_count; i++) {
+    const struct cal_sample *s = &cal_ring[(idx + i) % CAL_WIN];
+    if (llabs((long long)(s->iep - center_iep)) > half_ticks)
+      continue;
+    if (!n)
+      yb = s->wall;
+    sx += (double)(s->iep - xb);
+    sy += (double)(s->wall - yb);
+    n++;
+  }
+  if (n < CAL_MIN_SAMPLES)
+    return;
+  double mx = sx / n, my = sy / n;
+  double sxx = 0, sxy = 0;
+  for (int i = 0; i < cal_count; i++) {
+    const struct cal_sample *s = &cal_ring[(idx + i) % CAL_WIN];
+    if (llabs((long long)(s->iep - center_iep)) > half_ticks)
+      continue;
+    double dx = (double)(s->iep - xb) - mx;
+    double dy = (double)(s->wall - yb) - my;
+    sxx += dx * dx;
+    sxy += dx * dy;
+  }
+  if (sxx <= 0)
+    return;
+  double b = sxy / sxx;
+  double rss = 0;
+  for (int i = 0; i < cal_count; i++) {
+    const struct cal_sample *s = &cal_ring[(idx + i) % CAL_WIN];
+    if (llabs((long long)(s->iep - center_iep)) > half_ticks)
+      continue;
+    double r = ((double)(s->wall - yb) - my) - b * ((double)(s->iep - xb) - mx);
+    rss += r * r;
+  }
+  f->n = n;
+  f->slope = b;
+  f->x0 = mx;
+  f->y0 = my;
+  f->iep_base = xb;
+  f->wall_base = yb;
+  f->rms = sqrt(rss / n);
+  f->valid = (b > 4.9 && b < 5.1 && f->rms < 500.0);
+}
+
+static long long cal_eval(const struct cal_fit *f, int64_t iep) {
+  double rel = f->y0 + f->slope * ((double)(iep - f->iep_base) - f->x0);
+  return f->wall_base + (long long)rel;
+}
+
+/*
+ * UBX-TIM-TP sawtooth correction.
+ *
+ * The receiver can only place the timepulse edge on its own clock grid; the
+ * sub-grid error (up to ~±10 ns on an M8N) is reported per pulse as qErr in
+ * UBX-TIM-TP, which also carries the GPS week/tow of the pulse it describes.
+ * We take the raw UBX stream as a read-only gpsd client (?WATCH raw=2 — gpsd
+ * keeps owning the tty) and pair each TIM-TP to its pulse by converting
+ * week/tow to the UTC second and matching against the pulse's rounded second.
+ * A small history ring covers the ~2 s evaluation delay. qErr sign convention
+ * is applied via qerr_sign (see -q); 0 logs without correcting, for
+ * empirically confirming the convention against the measured offsets.
+ */
+#define GPSD_HOST "127.0.0.1"
+#define GPSD_PORT 2947
+#define GPS_EPOCH_UNIX 315964800LL
+#define GPS_UTC_LEAP_S 18 /* GPS-UTC offset; only used when timeBase=GPS */
+#define QHIST 8
+
+static struct {
+  long long sec;
+  double ns;
+} qhist[QHIST];
+static int qhead = 0;
+
+static void ubx_timtp(const uint8_t *p) {
+  uint32_t tow_ms = (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
+                    ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+  int32_t qerr_ps = (int32_t)((uint32_t)p[8] | ((uint32_t)p[9] << 8) |
+                              ((uint32_t)p[10] << 16) | ((uint32_t)p[11] << 24));
+  uint16_t week = (uint16_t)p[12] | ((uint16_t)p[13] << 8);
+  uint8_t flags = p[14];
+  long long t = GPS_EPOCH_UNIX + (long long)week * 604800LL + tow_ms / 1000;
+  if (!(flags & 1)) /* timeBase 0 = GPS: convert to UTC */
+    t -= GPS_UTC_LEAP_S;
+  qhist[qhead].sec = t;
+  qhist[qhead].ns = (double)qerr_ps / 1000.0;
+  qhead = (qhead + 1) % QHIST;
+}
+
+static int qerr_lookup(long long sec, double *ns) {
+  for (int i = 0; i < QHIST; i++) {
+    if (qhist[i].sec == sec) {
+      *ns = qhist[i].ns;
+      return 1;
+    }
+  }
+  return 0;
+}
+
+/* Byte-stream UBX frame scanner; ignores the interleaved NMEA text. */
+static void ubx_feed(const uint8_t *buf, ssize_t len) {
+  static int st = 0;
+  static uint8_t cls, id, ck_a, ck_b;
+  static uint16_t plen, pgot;
+  static uint8_t payload[64];
+  for (ssize_t i = 0; i < len; i++) {
+    uint8_t c = buf[i];
+    switch (st) {
+    case 0: st = (c == 0xB5) ? 1 : 0; break;
+    case 1: st = (c == 0x62) ? 2 : 0; break;
+    case 2: cls = c; ck_a = c; ck_b = c; st = 3; break;
+    case 3: id = c; ck_a += c; ck_b += ck_a; st = 4; break;
+    case 4: plen = c; ck_a += c; ck_b += ck_a; st = 5; break;
+    case 5:
+      plen |= (uint16_t)c << 8;
+      ck_a += c; ck_b += ck_a;
+      pgot = 0;
+      st = (plen > sizeof(payload)) ? 8 : (plen ? 6 : 7);
+      break;
+    case 6:
+      payload[pgot++] = c;
+      ck_a += c; ck_b += ck_a;
+      if (pgot == plen) st = 7;
+      break;
+    case 7: /* ck_a */
+      st = (c == ck_a) ? 9 : 0;
+      break;
+    case 8: /* oversized frame: consume payload without storing */
+      ck_a += c; ck_b += ck_a;
+      if (++pgot == plen) st = 7;
+      break;
+    case 9: /* ck_b */
+      if (c == ck_b && cls == 0x0D && id == 0x01 && plen == 16)
+        ubx_timtp(payload);
+      st = 0;
+      break;
+    }
+  }
+}
+
+static int gpsd_connect(void) {
+  int fd = socket(AF_INET, SOCK_STREAM, 0);
+  if (fd < 0)
+    return -1;
+  struct sockaddr_in a = {0};
+  a.sin_family = AF_INET;
+  a.sin_port = htons(GPSD_PORT);
+  inet_pton(AF_INET, GPSD_HOST, &a.sin_addr);
+  if (connect(fd, (struct sockaddr *)&a, sizeof(a)) < 0) {
+    close(fd);
+    return -1;
+  }
+  const char *watch = "?WATCH={\"enable\":true,\"raw\":2};\n";
+  if (write(fd, watch, strlen(watch)) < 0) {
+    close(fd);
+    return -1;
+  }
+  fcntl(fd, F_SETFL, fcntl(fd, F_GETFL, 0) | O_NONBLOCK);
+  return fd;
+}
+
+/* Pulses waiting for their centered window to mature (~2 s). */
+#define PEND_MAX 8
+struct pending {
+  int64_t pps_ext;
+  uint32_t seq;
+};
+static struct pending pend[PEND_MAX];
+static int pend_head = 0, pend_count = 0;
+
 int main(int argc, char **argv) {
   int shmunit = 2;
   const char *rpmsg_dev = RPMSG_DEV;
+  int qerr_sign = 0; /* -1/+1 apply, 0 = log-only (sign experiment) */
   int opt;
 
-  while ((opt = getopt(argc, argv, "s:r:")) != -1) {
+  while ((opt = getopt(argc, argv, "s:r:q:")) != -1) {
     switch (opt) {
     case 's':
       shmunit = atoi(optarg);
@@ -101,12 +346,17 @@ int main(int argc, char **argv) {
     case 'r':
       rpmsg_dev = optarg;
       break;
+    case 'q':
+      qerr_sign = atoi(optarg);
+      break;
     default:
-      fprintf(stderr, "Usage: %s [-s shmunit] [-r rpmsg_dev]\n", argv[0]);
+      fprintf(stderr, "Usage: %s [-s shmunit] [-r rpmsg_dev] [-q -1|0|1]\n",
+              argv[0]);
       return 1;
     }
   }
 
+  setlinebuf(stdout);
   signal(SIGINT, sighandler);
   signal(SIGTERM, sighandler);
 
@@ -160,159 +410,264 @@ int main(int argc, char **argv) {
   mlockall(MCL_CURRENT | MCL_FUTURE);
 
   uint32_t last_seq = pru->seq;
-  uint32_t prev_pps_iep = 0;
+  int64_t prev_pps_ext = 0;
   int have_prev = 0;
-  double ns_per_tick = 4.99971;
-  uint32_t good = 0, bad = 0;
-  uint32_t saved_delta = 0;
+  uint32_t good = 0, bad = 0, dropped = 0;
 
-  printf("pru_pps_shm: blocking on %s -> SHM unit %d (struct size=%zu)\n",
-         rpmsg_dev, shmunit, sizeof(struct shmTime));
+  /*
+   * Extended IEP counter: the hardware register is 32-bit and wraps every
+   * ~21.5 s at 200 MHz. All raw reads funnel through this single-threaded
+   * unwrapper; signed 32-bit deltas place any tick within ±10.7 s of the
+   * last committed read, which the 25 ms sampling cadence guarantees.
+   */
+  int64_t iep_ext = 0;
+  uint32_t iep_last_raw = iep[0x0C / 4];
+  int step_strikes = 0;
+
+  printf("pru_pps_shm: blocking on %s -> SHM unit %d (struct size=%zu, "
+         "qerr_sign=%d)\n",
+         rpmsg_dev, shmunit, sizeof(struct shmTime), qerr_sign);
   printf("Initial PRU seq=%u\n", last_seq);
 
-  struct pollfd pfd = {.fd = rpmsg_fd, .events = POLLIN};
   char rpmsg_buf[32];
+  struct cal_fit stepfit = {0};
+  int gpsd_fd = gpsd_connect();
+  long long gpsd_retry_ns = 0;
+  if (gpsd_fd < 0)
+    fprintf(stderr,
+            "pru_pps_shm: gpsd not reachable yet — qErr disabled until it is\n");
 
   while (running) {
-    /* Block until the PRU sends a PPS notification (2 s timeout) */
-    int pret = poll(&pfd, 1, 2000);
+    struct pollfd pfds[2] = {
+        {.fd = rpmsg_fd, .events = POLLIN},
+        {.fd = gpsd_fd, .events = POLLIN},
+    };
+    int pret = poll(pfds, gpsd_fd >= 0 ? 2 : 1, CAL_INTERVAL_MS);
     if (pret < 0) {
       if (errno == EINTR)
         continue;
       perror("poll");
       break;
     }
-    if (pret == 0) {
-      /* timeout — no PPS pulse in 2 s */
-      fprintf(stderr, "pru_pps_shm: no PPS in 2 s (seq=%u)\n", last_seq);
-      continue;
+
+    /* drain gpsd raw stream through the UBX scanner */
+    if (gpsd_fd >= 0 && (pfds[1].revents & (POLLIN | POLLERR | POLLHUP))) {
+      uint8_t gbuf[2048];
+      ssize_t gn = read(gpsd_fd, gbuf, sizeof(gbuf));
+      if (gn > 0) {
+        ubx_feed(gbuf, gn);
+      } else if (gn == 0 || (gn < 0 && errno != EAGAIN)) {
+        close(gpsd_fd);
+        gpsd_fd = -1;
+        fprintf(stderr, "pru_pps_shm: lost gpsd — will reconnect\n");
+      }
     }
+    if (gpsd_fd < 0) {
+      struct timespec tnow;
+      clock_gettime(CLOCK_MONOTONIC, &tnow);
+      long long mono = (long long)tnow.tv_sec * 1000000000LL + tnow.tv_nsec;
+      if (mono - gpsd_retry_ns > 5000000000LL) {
+        gpsd_retry_ns = mono;
+        gpsd_fd = gpsd_connect();
+        if (gpsd_fd >= 0)
+          fprintf(stderr, "pru_pps_shm: gpsd reconnected\n");
+      }
+    }
+
+    /*
+     * Calibration sandwich: bracket one IEP read with two REALTIME reads.
+     * A single uncached OCP read brackets at 1.5-3 us on this A8; keep the
+     * tightest of three so the accept rate stays high without loosening the
+     * gate into interrupt-smeared territory.
+     */
+    struct timespec t1, t2;
+    long long ns1 = 0, ns2 = 0;
+    long long best_bracket = LLONG_MAX;
+    uint32_t raw = 0;
+    for (int k = 0; k < 3; k++) {
+      clock_gettime(CLOCK_REALTIME, &t1);
+      uint32_t c = iep[0x0C / 4];
+      clock_gettime(CLOCK_REALTIME, &t2);
+      long long a = (long long)t1.tv_sec * 1000000000LL + t1.tv_nsec;
+      long long b = (long long)t2.tv_sec * 1000000000LL + t2.tv_nsec;
+      if (b - a < best_bracket) {
+        best_bracket = b - a;
+        ns1 = a;
+        ns2 = b;
+        raw = c;
+      }
+    }
+    iep_ext += (int32_t)(raw - iep_last_raw);
+    iep_last_raw = raw;
+    if (ns2 - ns1 < CAL_SPREAD_GATE_NS) {
+      long long mid = ns1 + (ns2 - ns1) / 2;
+      /*
+       * Step detection: chrony slews in steady state, but a step (makestep,
+       * manual set) breaks the line. Three consecutive wild residuals flush
+       * the window rather than letting the fit chase a stale model. The
+       * trailing fit here is used ONLY for this check, never to time pulses.
+       */
+      cal_fit_window(&stepfit, iep_ext, 2 * CAL_HALF_TICKS);
+      if (stepfit.valid) {
+        long long pred = cal_eval(&stepfit, iep_ext);
+        if (llabs(mid - pred) > CAL_STEP_GATE_NS) {
+          if (++step_strikes >= 3) {
+            fprintf(stderr,
+                    "pru_pps_shm: clock step detected — resetting calibration\n");
+            cal_reset();
+            step_strikes = 0;
+          }
+        } else {
+          step_strikes = 0;
+        }
+      }
+      cal_push(iep_ext, mid);
+    }
+
+    /*
+     * Evaluate any pulse whose centered window has matured: enough samples
+     * now exist on BOTH sides of the edge. Interpolation, not extrapolation.
+     */
+    while (pend_count) {
+      struct pending *p = &pend[pend_head];
+      if (iep_ext - p->pps_ext < CAL_HALF_TICKS)
+        break;
+      struct cal_fit wfit;
+      cal_fit_window(&wfit, p->pps_ext, CAL_HALF_TICKS);
+      if (!wfit.valid) {
+        /* window flushed or still filling: dropping one sample beats
+         * serving a 2 s extrapolation through a fixed slope */
+        dropped++;
+        pend_head = (pend_head + 1) % PEND_MAX;
+        pend_count--;
+        continue;
+      }
+      long long pps_wall_ns = cal_eval(&wfit, p->pps_ext);
+
+      long long rx_sec = pps_wall_ns / 1000000000LL;
+      long rx_nsec = (long)(pps_wall_ns % 1000000000LL);
+      if (rx_nsec < 0) {
+        rx_sec--;
+        rx_nsec += 1000000000L;
+      }
+
+      /*
+       * clockTimeStamp = the true UTC second the pulse represents.
+       * Round to nearest second — the PPS pulse nominally fires at
+       * an exact second boundary so sub-second residual is just noise.
+       */
+      long long clock_sec = rx_sec;
+      if (rx_nsec >= 500000000L)
+        clock_sec++;
+
+      /*
+       * Sawtooth correction: apply the TIM-TP qErr whose GPS-derived second
+       * matches this pulse exactly; a stale or missing message can never
+       * smear a wrong pulse. The ±10 ns adjustment can't cross a second
+       * boundary in practice.
+       */
+      double qerr_now = 0;
+      int qerr_matched = qerr_lookup(clock_sec, &qerr_now);
+      int qerr_applied = 0;
+      if (qerr_matched && qerr_sign) {
+        long long adj = (long long)(qerr_sign * qerr_now);
+        rx_nsec += (long)adj;
+        if (rx_nsec < 0) {
+          rx_sec--;
+          rx_nsec += 1000000000L;
+        } else if (rx_nsec >= 1000000000L) {
+          rx_sec++;
+          rx_nsec -= 1000000000L;
+        }
+        qerr_applied = 1;
+      }
+
+      long offset_ns = rx_nsec;
+      if (offset_ns > 500000000L)
+        offset_ns -= 1000000000L;
+
+      /* sign experiment: with -q 0, emit every matched pulse */
+      if (qerr_sign == 0 && qerr_matched)
+        printf("QEXP seq=%u offset=%+ld qerr=%+.1f\n", p->seq, offset_ns,
+               qerr_now);
+
+      /*
+       * Write SHM using mode-1 count handshake.
+       * count must be ODD while we are writing, EVEN when done.
+       */
+      shm->valid = 0;
+      __sync_synchronize();
+      shm->count++; /* now odd  */
+
+      shm->clockTimeStampSec = clock_sec;
+      shm->clockTimeStampUSec = 0;
+      shm->clockTimeStampNSec = 0;
+
+      shm->receiveTimeStampSec = rx_sec;
+      shm->receiveTimeStampUSec = (int32_t)(rx_nsec / 1000);
+      shm->receiveTimeStampNSec = (uint32_t)rx_nsec;
+
+      __sync_synchronize();
+      shm->count++; /* now even */
+      shm->valid = 1;
+
+      good++;
+      if (good <= 10 || (good % 10) == 1) {
+        printf("seq=%u offset=%+ld ns fit[n=%d rms=%.0fns slope=%.6f] "
+               "qerr=%+.1f%s [good=%u bad=%u dropped=%u]\n",
+               p->seq, offset_ns, wfit.n, wfit.rms, wfit.slope, qerr_now,
+               qerr_applied ? " applied" : (qerr_matched ? " logged" : " none"),
+               good, bad, dropped);
+      }
+      pend_head = (pend_head + 1) % PEND_MAX;
+      pend_count--;
+    }
+
+    if (!(pfds[0].revents & POLLIN))
+      continue; /* idle tick: sampled + drained, nothing else to do */
+
     /* drain the rpmsg message */
     (void)read(rpmsg_fd, rpmsg_buf, sizeof(rpmsg_buf));
 
     uint32_t seq = pru->seq;
     if (seq == last_seq)
       continue;
-
-    uint32_t pps_iep = pru->iep_lo;
-
-    /*
-     * Tight IEP-wall calibration: take 10 back-to-back samples,
-     * keep the one with the smallest gap between the two
-     * clock_gettime calls so we have the most accurate wall time
-     * for the IEP counter value.
-     */
-    struct timespec t1, t2;
-    long long best_spread = 999999999LL;
-    uint32_t best_cal_iep = 0;
-    long long best_cal_wall = 0;
-    int i;
-    for (i = 0; i < 10; i++) {
-      clock_gettime(CLOCK_REALTIME, &t1);
-      uint32_t c = iep[0x0C / 4];
-      clock_gettime(CLOCK_REALTIME, &t2);
-      long long ns1 = (long long)t1.tv_sec * 1000000000LL + t1.tv_nsec;
-      long long ns2 = (long long)t2.tv_sec * 1000000000LL + t2.tv_nsec;
-      long long spread = ns2 - ns1;
-      if (spread < best_spread) {
-        best_spread = spread;
-        best_cal_iep = c;
-        best_cal_wall = ns1 + spread / 2;
-      }
-    }
-
     last_seq = seq;
 
+    /*
+     * Place the latched edge on the extended timeline WITHOUT committing it
+     * to the unwrapper — the edge predates the sampler read above, so it
+     * must not move iep_last_raw backwards.
+     */
+    int64_t pps_ext = iep_ext + (int32_t)(pru->iep_lo - iep_last_raw);
+
     if (have_prev) {
-      uint32_t iep_delta = pps_iep - prev_pps_iep;
-      if (iep_delta < 150000000U || iep_delta > 250000000U) {
+      int64_t delta = pps_ext - prev_pps_ext;
+      if (delta < 150000000LL || delta > 250000000LL) {
         bad++;
-        prev_pps_iep = pps_iep;
+        prev_pps_ext = pps_ext;
         continue;
       }
-      double measured = 1e9 / (double)iep_delta;
-      ns_per_tick = ns_per_tick * 0.9 + measured * 0.1;
-      saved_delta = iep_delta;
-    }
-
-    prev_pps_iep = pps_iep;
-    if (!have_prev) {
+    } else {
       have_prev = 1;
-      printf("seq=%u pps_iep=%u (first pulse)\n", seq, pps_iep);
+      prev_pps_ext = pps_ext;
+      printf("seq=%u pps_ext=%lld (first pulse)\n", seq, (long long)pps_ext);
       continue;
     }
+    prev_pps_ext = pps_ext;
 
-    good++;
-
-    /*
-     * Compute the wall-clock time of the PPS edge by projecting
-     * back from the calibration point using the IEP tick rate.
-     *
-     * iep_offset is negative when pps_iep is earlier than
-     * best_cal_iep (the normal case — the pulse happened before
-     * we ran the calibration loop).
-     */
-    int32_t iep_offset = (int32_t)(pps_iep - best_cal_iep);
-    long long pps_wall_ns =
-        best_cal_wall + (long long)((double)iep_offset * ns_per_tick);
-
-    /*
-     * receiveTimeStamp = best estimate of wall time at the PPS edge.
-     * This is what we actually measured.
-     */
-    long long rx_sec = pps_wall_ns / 1000000000LL;
-    long rx_nsec = (long)(pps_wall_ns % 1000000000LL);
-    if (rx_nsec < 0) {
-      rx_sec--;
-      rx_nsec += 1000000000L;
-    }
-
-    /*
-     * clockTimeStamp = the true UTC second the pulse represents.
-     * Round to nearest second — the PPS pulse nominally fires at
-     * an exact second boundary so sub-second residual is just noise.
-     */
-    long long clock_sec = rx_sec;
-    if (rx_nsec >= 500000000L)
-      clock_sec++;
-
-    /* offset for diagnostics */
-    long offset_ns = rx_nsec;
-    if (offset_ns > 500000000L)
-      offset_ns -= 1000000000L;
-
-    /*
-     * Write SHM using mode-1 count handshake.
-     * count must be ODD while we are writing, EVEN when done.
-     */
-    shm->valid = 0;
-    __sync_synchronize();
-    shm->count++; /* now odd  */
-
-    shm->clockTimeStampSec = clock_sec;
-    shm->clockTimeStampUSec = 0;
-    shm->clockTimeStampNSec = 0;
-
-    shm->receiveTimeStampSec = rx_sec;
-    shm->receiveTimeStampUSec = (int32_t)(rx_nsec / 1000);
-    shm->receiveTimeStampNSec = (uint32_t)rx_nsec;
-
-    __sync_synchronize();
-    shm->count++; /* now even */
-    shm->valid = 1;
-
-    if (good <= 10 || (good % 10) == 1) {
-      uint32_t iep_gap = best_cal_iep - pps_iep;
-      printf("seq=%u delta=%u offset=%+ld ns gap=%u (%.1f us) "
-             "spread=%lld ns ns/tick=%.6f [good=%u]\n",
-             seq, saved_delta, offset_ns, iep_gap,
-             (double)iep_gap * ns_per_tick / 1000.0, best_spread, ns_per_tick,
-             good);
+    if (pend_count < PEND_MAX) {
+      pend[(pend_head + pend_count) % PEND_MAX] =
+          (struct pending){pps_ext, seq};
+      pend_count++;
+    } else {
+      dropped++;
     }
   }
 
   shm->valid = 0;
   close(rpmsg_fd);
-  printf("pru_pps_shm: exiting (good=%u bad=%u)\n", good, bad);
+  printf("pru_pps_shm: exiting (good=%u bad=%u dropped=%u)\n", good, bad,
+         dropped);
   return 0;
 }

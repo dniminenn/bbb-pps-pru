@@ -5,14 +5,15 @@
  * Copyright (c) 2026 dniminenn
  */
 
-#include "intc_map_0.h"
-#include "resource_table.h"
-#include <pru_cfg.h>
-#include <pru_intc.h>
-#include <pru_rpmsg.h>
-#include <pru_virtqueue.h>
 #include <stdint.h>
 #include <string.h>
+#include <pru_cfg.h>
+#include <pru_intc.h>
+#include <pru_types.h>
+#include <pru_rpmsg.h>
+#include <pru_virtqueue.h>
+#include "intc_map_0.h"
+#include "resource_table.h"
 
 #define IEP_GLOBAL_CFG (*(volatile uint32_t *)(0x0002E000))
 #define IEP_COMPEN (*(volatile uint32_t *)(0x0002E008))
@@ -92,14 +93,23 @@ int main(void) {
       pps_data.seq++;
       /* Wake the daemon via rpmsg */
       pru_rpmsg_send(&transport, arm_dst, arm_src, &notify, 1);
-    }
-    prev = cur;
 
-    /* drain any further rpmsg messages from host */
-    if (__R31 & HOST_INT) {
-      while (pru_rpmsg_receive(&transport, &arm_src, &arm_dst, buf, &len) ==
-             PRU_RPMSG_SUCCESS) {
+      /*
+       * Service host kicks ONLY here, in the pulse's shadow — the next
+       * rising edge is a full second away. Draining in the tight loop cost
+       * a vring scan between every R31 poll (the kick sysevent was never
+       * cleared, so HOST_INT stayed asserted after the first kick), which
+       * smeared edge detection by hundreds of ns. Clearing SICR re-arms
+       * the event; anything the host sends mid-second is handled after the
+       * next pulse, which the setup-byte protocol tolerates.
+       */
+      if (__R31 & HOST_INT) {
+        CT_INTC.SICR_bit.STS_CLR_IDX = FROM_ARM_HOST;
+        while (pru_rpmsg_receive(&transport, &arm_src, &arm_dst, buf, &len) ==
+               PRU_RPMSG_SUCCESS) {
+        }
       }
     }
+    prev = cur;
   }
 }
