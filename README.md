@@ -21,9 +21,18 @@ second, fully independent GPS reference to within a couple of microseconds. See
 
 By entirely bypassing the Linux GPIO IRQ pathway and capturing the pulse edge using the 200 MHz PRU Industrial Ethernet Peripheral (IEP) hardware timer, this implementation eliminates traditional interrupt latency jitter.
 
-- **Daemon Precision:** Typical wall-time residuals of 100 to 800 ns vs the true PPS edge.
+- **Edge capture:** pulse-to-pulse latch jitter of ~40 ns RMS. The PRU services rpmsg
+  only in the shadow of a pulse, so nothing interrupts the edge-detect loop.
+- **IEP-to-wall transfer:** the daemon fits a least-squares line through a window of
+  timer/wall sample pairs centered on each pulse, with residuals of ~8 ns RMS, instead
+  of projecting through a single sandwich read (the old method's 100 to 800 ns).
+- **Sawtooth correction:** the receiver's per-pulse quantization error (UBX-TIM-TP
+  `qErr`, up to ±10 ns on an M8N) is matched to its pulse by GPS week/tow and
+  subtracted, so the largest remaining deterministic error term is gone.
 - **System Clock Offset:** Once the Chrony servo converges, `chronyc tracking` reports system time offsets in the **low nanosecond domain** (often under ±10 ns).
-- **Jitter Profile:** The estimated standard deviation converges to ~1 ns, an order of magnitude better than standard `pps-gpio`, which routinely shows 5 to 20 µs of offset dispersion.
+- **Jitter Profile:** `chronyc sourcestats` standard deviation sits in single-digit
+  nanoseconds, orders of magnitude better than standard `pps-gpio`, which routinely
+  shows 5 to 20 µs of offset dispersion.
 
 Detailed tracking data and logs can be found in the [Measurements & Validation](docs/measurements.md) document.
 
