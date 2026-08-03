@@ -109,94 +109,127 @@ struct tcxo_shared {
 };
 
 /*
- * IEP <-> CLOCK_REALTIME transfer model.
+ * Two-stage transfer model: IEP -> MONOTONIC_RAW -> REALTIME.
  *
- * The original design took one min-spread calibration sandwich per pulse and
- * projected the edge through it — the ±few-hundred-ns midpoint ambiguity of a
- * single /dev/mem IEP read became the refclock's noise floor (~250 ns stddev
- * observed at chrony). The IEP counter and the ARM timekeeping clocksource
- * derive from the same 24 MHz master oscillator, so their relation is a line
- * (temperature moves both together); we therefore sample the pair continuously
- * and fit, shrinking the random sandwich noise by sqrt(N).
+ * The original design fitted IEP directly against CLOCK_REALTIME. That created
+ * a circular dependency: the daemon measured the PPS edge against the very
+ * clock chrony steers using the daemon's own samples. Every correction chrony
+ * applied perturbed the next measurement, so the refclock poll interval became
+ * the damping of an unintended control loop — and speeding it up (poll 0
+ * filter 4) drove it unstable in minutes: skew 0.006 -> 11.9 ppm, root
+ * dispersion 3 -> 56 us, pulse offsets swinging +-16 us.
  *
- * CLOCK_REALTIME, however, is only piecewise-linear: chrony adjusts its slope
- * every poll interval — partly in response to OUR samples. Evaluating a pulse
- * against a trailing fit extrapolates across those slope kinks, and the
- * daemon+chrony feedback loop rings at hundreds of ns (measured 300-900 ns
- * scatter). So pulses are held for CAL_HALF_TICKS and evaluated against a
- * window CENTERED on the edge — interpolation, where kink errors average out.
- * The SHM sample lands ~2 s late, which chrony's SHM driver handles fine
- * (receiveTimeStamp carries the sample's own epoch).
+ * Splitting the model removes the feedback from the precision-critical term:
+ *
+ *   fit A: IEP <-> CLOCK_MONOTONIC_RAW    hardware to hardware. RAW is never
+ *          adjusted by NTP (unlike CLOCK_MONOTONIC, which is frequency
+ *          corrected), so this relation is genuinely linear with no kinks to
+ *          extrapolate across. Long window, and the noisy term lives here:
+ *          reading the IEP is an uncached OCP access costing microseconds,
+ *          which averaging over many samples suppresses.
+ *
+ *   fit B: MONOTONIC_RAW <-> (REALTIME - MONOTONIC_RAW)   i.e. chrony's own
+ *          cumulative adjustment, and nothing else. Short window, because this
+ *          must TRACK corrections rather than average them away. Its samples
+ *          are two back-to-back clock_gettime() calls (vDSO, cheap and tight),
+ *          so a short window is affordable here.
+ *
+ * The pulse is placed by evaluating fit A at the latched tick, then adding
+ * fit B at that instant. Because fit A is linear, evaluating it slightly past
+ * its newest sample is harmless, so the old "hold each pulse for half a window
+ * then interpolate" trick is gone — which also removes ~0.5 s of delay from
+ * inside chrony's servo loop.
+ *
+ * MONOTONIC_RAW plays the role a NIC PHC plays on a machine that disciplines
+ * a separate hardware clock and then steers the system clock from it: a
+ * reference the consumer of the measurement never perturbs. The AM335x CPTS
+ * could serve that role literally (it exposes 4 extts channels), but it has no
+ * PTP_SYS_OFFSET_PRECISE, so reading it costs tens of microseconds with
+ * microsecond-scale scatter - far worse than this.
  */
-#define CAL_WIN 512          /* ring capacity */
-#define CAL_INTERVAL_MS 25   /* sampling cadence between pulses */
-#define CAL_SPREAD_GATE_NS 2000
-#define CAL_STEP_GATE_NS 10000 /* residual beyond this = the clock stepped */
+#define CAL_WIN 512               /* fit A ring: IEP <-> MONOTONIC_RAW      */
+#define ADJ_WIN 128               /* fit B ring: chrony's adjustment        */
+#define CAL_INTERVAL_MS 25
+#define CAL_SPREAD_GATE_NS 2000   /* accept an IEP bracket this tight       */
+#define ADJ_SPREAD_GATE_NS 4000   /* 3 clock_gettime calls; each costs ~1us   */
 #define CAL_MIN_SAMPLES 24
-/* ±0.5 s around the pulse. Wider windows average more but delay the sample —
- * and that delay sits inside chrony's servo loop: at ±2 s chrony visibly
- * hunted (±400 ns wander, skew x50). Fit residuals are ~8 ns, so a 40-sample
- * window already evaluates the edge at the couple-ns level. */
-#define CAL_HALF_TICKS 100000000LL
+#define ADJ_MIN_SAMPLES 8
+#define CAL_SPAN_NS 8000000000LL  /* fit A horizon: 8 s of linear relation  */
+#define ADJ_SPAN_NS 2000000000LL  /* fit B horizon: 2 s, tracks corrections */
+#define ADJ_STEP_GATE_NS 10000    /* residual beyond this = clock stepped   */
 
 struct cal_sample {
   int64_t iep;    /* extended (unwrapped) IEP ticks */
-  long long wall; /* CLOCK_REALTIME ns at that tick */
+  long long mono; /* CLOCK_MONOTONIC_RAW ns at that tick */
+};
+
+struct adj_sample {
+  long long mono; /* CLOCK_MONOTONIC_RAW ns */
+  long long adj;  /* REALTIME - MONOTONIC_RAW at that instant */
 };
 
 struct cal_fit {
   int n;
-  double slope;         /* ns per tick */
-  double x0, y0;        /* centroid, relative to the int64 bases below */
-  int64_t iep_base;     /* rebasing anchors: doubles only ever hold small */
-  long long wall_base;  /* deltas, or a 2026 wall time truncates to 256 ns */
-  double rms;           /* residual RMS, ns */
+  double slope;        /* ns per tick (fit A) or ns/ns (fit B) */
+  double x0, y0;       /* centroid, relative to the bases below */
+  int64_t xbase;
+  long long ybase;
+  double rms;
   int valid;
 };
 
 static struct cal_sample cal_ring[CAL_WIN];
 static int cal_head = 0, cal_count = 0;
+static struct adj_sample adj_ring[ADJ_WIN];
+static int adj_head = 0, adj_count = 0;
 
-static void cal_reset(void) { cal_head = cal_count = 0; }
+static void cal_reset(void) {
+  cal_head = cal_count = 0;
+  adj_head = adj_count = 0;
+}
 
-static void cal_push(int64_t iep, long long wall) {
-  cal_ring[cal_head] = (struct cal_sample){iep, wall};
+static void cal_push(int64_t iep, long long mono) {
+  cal_ring[cal_head] = (struct cal_sample){iep, mono};
   cal_head = (cal_head + 1) % CAL_WIN;
   if (cal_count < CAL_WIN)
     cal_count++;
 }
 
-/* Least-squares wall = f(iep) over samples within ±half_ticks of center. */
-static void cal_fit_window(struct cal_fit *f, int64_t center_iep,
-                           int64_t half_ticks) {
+static void adj_push(long long mono, long long adj) {
+  adj_ring[adj_head] = (struct adj_sample){mono, adj};
+  adj_head = (adj_head + 1) % ADJ_WIN;
+  if (adj_count < ADJ_WIN)
+    adj_count++;
+}
+
+/* fit A: least squares MONOTONIC_RAW = f(IEP) over the trailing CAL_SPAN_NS. */
+static void cal_fit_iep(struct cal_fit *f) {
   memset(f, 0, sizeof(*f));
-  if (cal_count < 2)
+  if (cal_count < CAL_MIN_SAMPLES)
     return;
   int idx = (cal_head + CAL_WIN - cal_count) % CAL_WIN;
-  int64_t xb = center_iep;
-  long long yb = 0;
+  const struct cal_sample *newest = &cal_ring[(cal_head + CAL_WIN - 1) % CAL_WIN];
+  int64_t xb = newest->iep;
+  long long yb = newest->mono;
   double sx = 0, sy = 0;
   int n = 0;
   for (int i = 0; i < cal_count; i++) {
     const struct cal_sample *s = &cal_ring[(idx + i) % CAL_WIN];
-    if (llabs((long long)(s->iep - center_iep)) > half_ticks)
+    if (newest->mono - s->mono > CAL_SPAN_NS)
       continue;
-    if (!n)
-      yb = s->wall;
     sx += (double)(s->iep - xb);
-    sy += (double)(s->wall - yb);
+    sy += (double)(s->mono - yb);
     n++;
   }
   if (n < CAL_MIN_SAMPLES)
     return;
-  double mx = sx / n, my = sy / n;
-  double sxx = 0, sxy = 0;
+  double mx = sx / n, my = sy / n, sxx = 0, sxy = 0;
   for (int i = 0; i < cal_count; i++) {
     const struct cal_sample *s = &cal_ring[(idx + i) % CAL_WIN];
-    if (llabs((long long)(s->iep - center_iep)) > half_ticks)
+    if (newest->mono - s->mono > CAL_SPAN_NS)
       continue;
     double dx = (double)(s->iep - xb) - mx;
-    double dy = (double)(s->wall - yb) - my;
+    double dy = (double)(s->mono - yb) - my;
     sxx += dx * dx;
     sxy += dx * dy;
   }
@@ -206,25 +239,77 @@ static void cal_fit_window(struct cal_fit *f, int64_t center_iep,
   double rss = 0;
   for (int i = 0; i < cal_count; i++) {
     const struct cal_sample *s = &cal_ring[(idx + i) % CAL_WIN];
-    if (llabs((long long)(s->iep - center_iep)) > half_ticks)
+    if (newest->mono - s->mono > CAL_SPAN_NS)
       continue;
-    double r = ((double)(s->wall - yb) - my) - b * ((double)(s->iep - xb) - mx);
+    double r = ((double)(s->mono - yb) - my) - b * ((double)(s->iep - xb) - mx);
     rss += r * r;
   }
   f->n = n;
   f->slope = b;
   f->x0 = mx;
   f->y0 = my;
-  f->iep_base = xb;
-  f->wall_base = yb;
+  f->xbase = xb;
+  f->ybase = yb;
   f->rms = sqrt(rss / n);
-  f->valid = (b > 4.9 && b < 5.1 && f->rms < 500.0);
+  /* ~5 ns per tick at 200 MHz; RAW is unsteered so this must be very stable */
+  f->valid = (b > 4.9 && b < 5.1 && f->rms < 2000.0);
 }
 
-static long long cal_eval(const struct cal_fit *f, int64_t iep) {
-  double rel = f->y0 + f->slope * ((double)(iep - f->iep_base) - f->x0);
-  return f->wall_base + (long long)rel;
+/* fit B: least squares adj = f(MONOTONIC_RAW) over the trailing ADJ_SPAN_NS. */
+static void cal_fit_adj(struct cal_fit *f) {
+  memset(f, 0, sizeof(*f));
+  if (adj_count < ADJ_MIN_SAMPLES)
+    return;
+  int idx = (adj_head + ADJ_WIN - adj_count) % ADJ_WIN;
+  const struct adj_sample *newest = &adj_ring[(adj_head + ADJ_WIN - 1) % ADJ_WIN];
+  long long xb = newest->mono, yb = newest->adj;
+  double sx = 0, sy = 0;
+  int n = 0;
+  for (int i = 0; i < adj_count; i++) {
+    const struct adj_sample *s = &adj_ring[(idx + i) % ADJ_WIN];
+    if (newest->mono - s->mono > ADJ_SPAN_NS)
+      continue;
+    sx += (double)(s->mono - xb);
+    sy += (double)(s->adj - yb);
+    n++;
+  }
+  if (n < ADJ_MIN_SAMPLES)
+    return;
+  double mx = sx / n, my = sy / n, sxx = 0, sxy = 0;
+  for (int i = 0; i < adj_count; i++) {
+    const struct adj_sample *s = &adj_ring[(idx + i) % ADJ_WIN];
+    if (newest->mono - s->mono > ADJ_SPAN_NS)
+      continue;
+    double dx = (double)(s->mono - xb) - mx;
+    double dy = (double)(s->adj - yb) - my;
+    sxx += dx * dx;
+    sxy += dx * dy;
+  }
+  double b = (sxx > 0) ? sxy / sxx : 0.0;   /* slope = chrony's slew rate */
+  double rss = 0;
+  for (int i = 0; i < adj_count; i++) {
+    const struct adj_sample *s = &adj_ring[(idx + i) % ADJ_WIN];
+    if (newest->mono - s->mono > ADJ_SPAN_NS)
+      continue;
+    double r = ((double)(s->adj - yb) - my) - b * ((double)(s->mono - xb) - mx);
+    rss += r * r;
+  }
+  f->n = n;
+  f->slope = b;
+  f->x0 = mx;
+  f->y0 = my;
+  f->xbase = xb;
+  f->ybase = yb;
+  f->rms = sqrt(rss / n);
+  /* chrony slews at ppm scale; anything past 1000 ppm means a step happened */
+  f->valid = (b > -1e-3 && b < 1e-3);
 }
+
+static long long cal_eval(const struct cal_fit *f, int64_t x) {
+  double rel = f->y0 + f->slope * ((double)(x - f->xbase) - f->x0);
+  return f->ybase + (long long)rel;
+}
+
 
 /*
  * UBX-TIM-TP sawtooth correction.
@@ -447,7 +532,7 @@ int main(int argc, char **argv) {
   printf("Initial PRU seq=%u\n", last_seq);
 
   char rpmsg_buf[32];
-  struct cal_fit stepfit = {0};
+  struct cal_fit iepfit = {0}, adjfit = {0};
   int gpsd_fd = gpsd_connect();
   long long gpsd_retry_ns = 0;
   if (gpsd_fd < 0)
@@ -551,74 +636,88 @@ int main(int argc, char **argv) {
     }
 
     /*
-     * Calibration sandwich: bracket one IEP read with two REALTIME reads.
-     * A single uncached OCP read brackets at 1.5-3 us on this A8; keep the
-     * tightest of three so the accept rate stays high without loosening the
-     * gate into interrupt-smeared territory.
+     * Sampler. Two independent brackets per iteration:
+     *
+     *   fit A pair: MONOTONIC_RAW / IEP / MONOTONIC_RAW. The IEP read is an
+     *   uncached OCP access bracketing at 1.5-3 us on this A8, so keep the
+     *   tightest of three.
+     *
+     *   fit B pair: MONOTONIC_RAW / REALTIME / MONOTONIC_RAW. Both are vDSO
+     *   reads and bracket far tighter, so one attempt is enough.
      */
-    struct timespec t1, t2;
-    long long ns1 = 0, ns2 = 0;
+    struct timespec t1, t2, t3;
+    long long m1 = 0, m2 = 0;
     long long best_bracket = LLONG_MAX;
     uint32_t raw = 0;
     for (int k = 0; k < 3; k++) {
-      clock_gettime(CLOCK_REALTIME, &t1);
+      clock_gettime(CLOCK_MONOTONIC_RAW, &t1);
       uint32_t c = iep[0] /* eCAP TSCTR */;
-      clock_gettime(CLOCK_REALTIME, &t2);
+      clock_gettime(CLOCK_MONOTONIC_RAW, &t2);
       long long a = (long long)t1.tv_sec * 1000000000LL + t1.tv_nsec;
       long long b = (long long)t2.tv_sec * 1000000000LL + t2.tv_nsec;
       if (b - a < best_bracket) {
         best_bracket = b - a;
-        ns1 = a;
-        ns2 = b;
+        m1 = a;
+        m2 = b;
         raw = c;
       }
     }
     iep_ext += (int32_t)(raw - iep_last_raw);
     iep_last_raw = raw;
-    if (ns2 - ns1 < CAL_SPREAD_GATE_NS) {
-      long long mid = ns1 + (ns2 - ns1) / 2;
-      /*
-       * Step detection: chrony slews in steady state, but a step (makestep,
-       * manual set) breaks the line. Three consecutive wild residuals flush
-       * the window rather than letting the fit chase a stale model. The
-       * trailing fit here is used ONLY for this check, never to time pulses.
-       */
-      cal_fit_window(&stepfit, iep_ext, 2 * CAL_HALF_TICKS);
-      if (stepfit.valid) {
-        long long pred = cal_eval(&stepfit, iep_ext);
-        if (llabs(mid - pred) > CAL_STEP_GATE_NS) {
-          if (++step_strikes >= 3) {
-            fprintf(stderr,
-                    "pru_pps_shm: clock step detected — resetting calibration\n");
-            cal_reset();
+    if (m2 - m1 < CAL_SPREAD_GATE_NS)
+      cal_push(iep_ext, m1 + (m2 - m1) / 2);
+
+    /* chrony's cumulative adjustment, REALTIME - MONOTONIC_RAW */
+    clock_gettime(CLOCK_MONOTONIC_RAW, &t1);
+    clock_gettime(CLOCK_REALTIME, &t3);
+    clock_gettime(CLOCK_MONOTONIC_RAW, &t2);
+    {
+      long long a = (long long)t1.tv_sec * 1000000000LL + t1.tv_nsec;
+      long long b = (long long)t2.tv_sec * 1000000000LL + t2.tv_nsec;
+      long long rt = (long long)t3.tv_sec * 1000000000LL + t3.tv_nsec;
+      if (b - a < ADJ_SPREAD_GATE_NS) {
+        long long mono_mid = a + (b - a) / 2;
+        /*
+         * Step detection lives here now, where it belongs: a chrony step is a
+         * discontinuity in the adjustment, and fit B is the only thing that
+         * models it. Three consecutive wild residuals flush both rings.
+         */
+        if (adjfit.valid) {
+          long long pred = cal_eval(&adjfit, mono_mid);
+          if (llabs((rt - mono_mid) - pred) > ADJ_STEP_GATE_NS) {
+            if (++step_strikes >= 3) {
+              fprintf(stderr,
+                      "pru_pps_shm: clock step detected - resetting calibration\n");
+              cal_reset();
+              step_strikes = 0;
+            }
+          } else {
             step_strikes = 0;
           }
-        } else {
-          step_strikes = 0;
         }
+        adj_push(mono_mid, rt - mono_mid);
       }
-      cal_push(iep_ext, mid);
     }
+    cal_fit_iep(&iepfit);
+    cal_fit_adj(&adjfit);
 
     /*
-     * Evaluate any pulse whose centered window has matured: enough samples
-     * now exist on BOTH sides of the edge. Interpolation, not extrapolation.
+     * Place any pending pulse. No waiting for a window to mature: fit A is a
+     * hardware-to-hardware relation with no kinks, so evaluating it at an edge
+     * a few ms behind its newest sample is as good as interpolating.
      */
     while (pend_count) {
       struct pending *p = &pend[pend_head];
-      if (iep_ext - p->pps_ext < CAL_HALF_TICKS)
-        break;
-      struct cal_fit wfit;
-      cal_fit_window(&wfit, p->pps_ext, CAL_HALF_TICKS);
-      if (!wfit.valid) {
-        /* window flushed or still filling: dropping one sample beats
-         * serving a 2 s extrapolation through a fixed slope */
-        dropped++;
-        pend_head = (pend_head + 1) % PEND_MAX;
-        pend_count--;
+      pend_head = (pend_head + 1) % PEND_MAX;
+      pend_count--;
+      if (!iepfit.valid || !adjfit.valid) {
+        dropped++;   /* rings still filling, or a step just flushed them */
         continue;
       }
-      long long pps_wall_ns = cal_eval(&wfit, p->pps_ext);
+      /* edge on the unsteered timeline, then chrony's adjustment at that
+       * instant: REALTIME = MONOTONIC_RAW + adj */
+      long long mono_edge = cal_eval(&iepfit, p->pps_ext);
+      long long pps_wall_ns = mono_edge + cal_eval(&adjfit, mono_edge);
 
       long long rx_sec = pps_wall_ns / 1000000000LL;
       long rx_nsec = (long)(pps_wall_ns % 1000000000LL);
@@ -689,14 +788,14 @@ int main(int argc, char **argv) {
 
       good++;
       if (good <= 10 || (good % 10) == 1) {
-        printf("seq=%u offset=%+ld ns fit[n=%d rms=%.0fns slope=%.6f] "
+        printf("seq=%u offset=%+ld ns A[n=%d rms=%.0fns slope=%.6f] "
+               "B[n=%d rms=%.0fns slew=%+.3fppm] "
                "qerr=%+.1f%s [good=%u bad=%u dropped=%u]\n",
-               p->seq, offset_ns, wfit.n, wfit.rms, wfit.slope, qerr_now,
+               p->seq, offset_ns, iepfit.n, iepfit.rms, iepfit.slope,
+               adjfit.n, adjfit.rms, adjfit.slope * 1e6, qerr_now,
                qerr_applied ? " applied" : (qerr_matched ? " logged" : " none"),
                good, bad, dropped);
       }
-      pend_head = (pend_head + 1) % PEND_MAX;
-      pend_count--;
     }
 
     if (!(pfds[0].revents & POLLIN))
