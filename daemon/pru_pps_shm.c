@@ -23,6 +23,7 @@
 #include <sys/shm.h>
 #include <sys/socket.h>
 #include <time.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 /*
@@ -183,8 +184,16 @@ static int cal_head = 0, cal_count = 0;
 static struct adj_sample adj_ring[ADJ_WIN];
 static int adj_head = 0, adj_count = 0;
 
-static void cal_reset(void) {
-  cal_head = cal_count = 0;
+/*
+ * A CLOCK_REALTIME step invalidates only fit B, which models
+ * REALTIME - MONOTONIC_RAW. Fit A is IEP against MONOTONIC_RAW - hardware
+ * against hardware - and cannot be affected by anything chrony does to
+ * REALTIME. Flushing it on a step threw away a converged 512-sample window
+ * (n~370, 7ns residual) and restarted at n~25 with a ~4x noisier slope, which
+ * fed bad pulses to chrony, which corrected harder, which tripped this gate
+ * again. Reset the two fits independently.
+ */
+static void adj_reset(void) {
   adj_head = adj_count = 0;
 }
 
@@ -431,6 +440,51 @@ struct pending {
 };
 static struct pending pend[PEND_MAX];
 static int pend_head = 0, pend_count = 0;
+
+
+/*
+ * Publish servo state as a Prometheus textfile for the metrics exporter to
+ * merge. Written to tmpfs and renamed into place so a scrape never sees a
+ * partial file. Called from the existing report point so it adds no new I/O
+ * cadence to the capture loop.
+ */
+#define PROM_PATH "/run/ts2phc/iep.prom"
+static void write_prom(long offset_ns, double iep_rms, double iep_slope,
+                       double adj_rms, double adj_slew, double qerr,
+                       unsigned good, unsigned bad, unsigned dropped) {
+  char tmp[] = PROM_PATH ".XXXXXX";
+  int fd = mkstemp(tmp);
+  if (fd < 0) return;
+  (void)fchmod(fd, 0644);
+  FILE* f = fdopen(fd, "w");
+  if (!f) { close(fd); unlink(tmp); return; }
+  fprintf(f,
+    "# HELP ts2phc_offset_ns PPS offset against the capture clock, nanoseconds\n"
+    "# TYPE ts2phc_offset_ns gauge\n"
+    "ts2phc_offset_ns{clock=\"iep0\"} %ld\n"
+    "# HELP ts2phc_freq_ppb Capture-clock frequency error, parts per billion\n"
+    "# TYPE ts2phc_freq_ppb gauge\n"
+    "ts2phc_freq_ppb{clock=\"iep0\"} %.1f\n"
+    "# HELP pps_fit_rms_ns Least-squares residual of each transfer fit\n"
+    "# TYPE pps_fit_rms_ns gauge\n"
+    "pps_fit_rms_ns{fit=\"iep\"} %.1f\n"
+    "pps_fit_rms_ns{fit=\"adj\"} %.1f\n"
+    "# HELP pps_fit_slope Fitted slope of each transfer fit\n"
+    "# TYPE pps_fit_slope gauge\n"
+    "pps_fit_slope{fit=\"iep\"} %.9f\n"
+    "# HELP pps_timepulse_quantization_error_ns Receiver sawtooth correction\n"
+    "# TYPE pps_timepulse_quantization_error_ns gauge\n"
+    "pps_timepulse_quantization_error_ns %.1f\n"
+    "# HELP pps_pulses_total PPS pulses by disposition\n"
+    "# TYPE pps_pulses_total counter\n"
+    "pps_pulses_total{disposition=\"good\"} %u\n"
+    "pps_pulses_total{disposition=\"bad\"} %u\n"
+    "pps_pulses_total{disposition=\"dropped\"} %u\n",
+    offset_ns, adj_slew * 1e9, iep_rms, adj_rms, iep_slope, qerr,
+    good, bad, dropped);
+  if (fclose(f) != 0) { unlink(tmp); return; }
+  if (rename(tmp, PROM_PATH) != 0) unlink(tmp);
+}
 
 int main(int argc, char **argv) {
   int shmunit = 2;
@@ -687,8 +741,8 @@ int main(int argc, char **argv) {
           if (llabs((rt - mono_mid) - pred) > ADJ_STEP_GATE_NS) {
             if (++step_strikes >= 3) {
               fprintf(stderr,
-                      "pru_pps_shm: clock step detected - resetting calibration\n");
-              cal_reset();
+                      "pru_pps_shm: clock step detected - resetting adjustment fit\n");
+              adj_reset();
               step_strikes = 0;
             }
           } else {
@@ -795,6 +849,10 @@ int main(int argc, char **argv) {
                adjfit.n, adjfit.rms, adjfit.slope * 1e6, qerr_now,
                qerr_applied ? " applied" : (qerr_matched ? " logged" : " none"),
                good, bad, dropped);
+      }
+      if (good <= 10 || (good % 10) == 1) {
+        write_prom(offset_ns, iepfit.rms, iepfit.slope, adjfit.rms,
+                   adjfit.slope, qerr_now, good, bad, dropped);
       }
     }
 
