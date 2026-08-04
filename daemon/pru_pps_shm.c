@@ -174,7 +174,17 @@ struct tcxo_shared {
  * microsecond-scale scatter - far worse than this.
  */
 #define CAL_WIN 512               /* fit A ring: IEP <-> MONOTONIC_RAW      */
-#define ADJ_WIN 128               /* fit B ring: chrony's adjustment        */
+#define ADJ_WIN 512               /* fit B ring: chrony's adjustment        */
+/*
+ * Extra (RAW,REALTIME) pairs per loop iteration. What reaches the reported
+ * offset is fit B's prediction error at the pulse, ~rms/sqrt(n) times the
+ * edge leverage -- so n is the lever, not per-sample noise (tightening the
+ * bracket gate was tried and lost more samples than it gained precision).
+ * Density is raised inside the existing 2 s horizon rather than by widening
+ * it, because REALTIME-MONOTONIC_RAW slews at ~53ppm and a longer window
+ * curves away from the straight line being fitted.
+ */
+#define ADJ_EXTRA_SAMPLES 3
 #define CAL_INTERVAL_MS 25
 #define CAL_SPREAD_GATE_NS 2000   /* accept an IEP bracket this tight       */
 #define ADJ_SPREAD_GATE_NS 4000   /* 3 clock_gettime calls; each costs ~1us   */
@@ -775,6 +785,23 @@ int main(int argc, char **argv) {
           }
         }
         adj_push(mono_mid, rt - mono_mid);
+      }
+    }
+
+    /* Additional pairs, same horizon: raises n without widening the window.
+     * Step detection deliberately stays on the first sample only, so strike
+     * accounting is unchanged. */
+    for (int k = 0; k < ADJ_EXTRA_SAMPLES; ++k) {
+      struct timespec e1, e2, e3;
+      clock_gettime(CLOCK_MONOTONIC_RAW, &e1);
+      clock_gettime(CLOCK_REALTIME, &e3);
+      clock_gettime(CLOCK_MONOTONIC_RAW, &e2);
+      long long ea = (long long)e1.tv_sec * 1000000000LL + e1.tv_nsec;
+      long long eb = (long long)e2.tv_sec * 1000000000LL + e2.tv_nsec;
+      long long er = (long long)e3.tv_sec * 1000000000LL + e3.tv_nsec;
+      if (eb - ea < ADJ_SPREAD_GATE_NS) {
+        long long emid = ea + (eb - ea) / 2;
+        adj_push(emid, er - emid);
       }
     }
     cal_fit_iep(&iepfit);
