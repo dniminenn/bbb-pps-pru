@@ -14,6 +14,7 @@
 #include <poll.h>
 #include <sched.h>
 #include <signal.h>
+#include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -41,11 +42,21 @@
  * offset 40: int precision (4)
  * offset 44: int nsamples (4)
  * offset 48: int valid (4)
- * offset 52: pad (4)
- * offset 56: unsigned clockTimeStampNSec (4)
- * offset 60: unsigned receiveTimeStampNSec (4)
- * offset 64: int dummy[8] (32)
- * total: 96 bytes
+ * offset 52: unsigned clockTimeStampNSec (4)
+ * offset 56: unsigned receiveTimeStampNSec (4)
+ * offset 60: int dummy[8] (32)
+ * total: 96 bytes (92 used, tail padded to the 8-byte alignment of time_t)
+ *
+ * The NSec pair follows `valid` with NO padding: both are 4-byte types, so
+ * nothing needs aligning. An earlier version of this struct inserted a 4-byte
+ * pad here, which pushed both NSec fields 4 bytes past where chrony reads
+ * them. Chrony then saw clockTimeStampNSec = receiveTimeStampNSec = 0; that is
+ * self-consistent with the USec fields whenever the offset is a small positive
+ * number (0/1000 == 0), so chrony accepted them and measured an offset of
+ * exactly zero, and fell back to USec resolution otherwise. The refclock was
+ * therefore disciplined by a 1 us quantizer: 88858 logged samples, not one
+ * with sub-microsecond content, while the true error sat at +435 ns. The
+ * asserts below exist so that can never silently return.
  */
 struct shmTime {
   int32_t mode;                  /*  0 */
@@ -59,11 +70,25 @@ struct shmTime {
   int32_t precision;             /* 40 */
   int32_t nsamples;              /* 44 */
   int32_t valid;                 /* 48 */
-  int32_t _pad2;                 /* 52 */
-  uint32_t clockTimeStampNSec;   /* 56 */
-  uint32_t receiveTimeStampNSec; /* 60 */
-  int32_t dummy[8];              /* 64 */
+  uint32_t clockTimeStampNSec;   /* 52 */
+  uint32_t receiveTimeStampNSec; /* 56 */
+  int32_t dummy[8];              /* 60 */
 };
+
+/*
+ * These offsets are an ABI shared with chronyd/gpsd, not an implementation
+ * detail. Verified empirically against gpsd's live SHM 0 on the same host:
+ * clockTimeStampUSec=243 alongside clockTimeStampNSec=243230 at offset 52, and
+ * receiveTimeStampUSec=216913 alongside receiveTimeStampNSec=216913865 at 56.
+ */
+_Static_assert(offsetof(struct shmTime, clockTimeStampSec) == 8, "shmTime ABI");
+_Static_assert(offsetof(struct shmTime, clockTimeStampUSec) == 16, "shmTime ABI");
+_Static_assert(offsetof(struct shmTime, receiveTimeStampSec) == 24, "shmTime ABI");
+_Static_assert(offsetof(struct shmTime, receiveTimeStampUSec) == 32, "shmTime ABI");
+_Static_assert(offsetof(struct shmTime, valid) == 48, "shmTime ABI");
+_Static_assert(offsetof(struct shmTime, clockTimeStampNSec) == 52, "shmTime ABI");
+_Static_assert(offsetof(struct shmTime, receiveTimeStampNSec) == 56, "shmTime ABI");
+_Static_assert(sizeof(struct shmTime) == 96, "shmTime ABI");
 
 struct pru_pps_data {
   volatile uint32_t seq;
