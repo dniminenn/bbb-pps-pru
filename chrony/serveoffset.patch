@@ -1,0 +1,89 @@
+--- a/ntp_core.c	2024-10-08 09:49:43.000000000 -0300
++++ b/ntp_core.c	2026-08-22 19:41:12.333931975 -0300
+@@ -1142,8 +1142,8 @@
+ {
+   NTP_PacketInfo info;
+   NTP_Packet message;
+-  struct timespec local_receive, local_transmit;
+-  double smooth_offset, local_transmit_err;
++  struct timespec local_receive, local_transmit, ilv_transmit;
++  double smooth_offset, local_transmit_err, serve_off;
+   int ret, precision;
+   NTP_int64 ts_fuzz;
+ 
+@@ -1207,6 +1207,11 @@
+     local_receive = local_rx->ts;
+   }
+ 
++  /* serveoffset: bias served timestamps only */
++  serve_off = my_mode == MODE_SERVER ? CNF_GetServeOffset() : 0.0;
++  if (serve_off != 0.0 && !UTI_IsZeroTimespec(&local_receive))
++    UTI_AddDoubleToTimespec(&local_receive, serve_off, &local_receive);
++
+   if (kod != 0) {
+     leap_status = LEAP_Unsynchronised;
+     our_stratum = NTP_INVALID_STRATUM;
+@@ -1283,9 +1288,16 @@
+       LCL_ReadCookedTime(&local_transmit, &local_transmit_err);
+       if (smooth_time)
+         UTI_AddDoubleToTimespec(&local_transmit, smooth_offset, &local_transmit);
++      if (serve_off != 0.0)
++        UTI_AddDoubleToTimespec(&local_transmit, serve_off, &local_transmit);
+     }
+ 
+-    UTI_TimespecToNtp64(interleaved ? &local_tx->ts : &local_transmit,
++    /* copy keeps stored tx raw */
++    ilv_transmit = local_tx ? local_tx->ts : local_transmit;
++    if (interleaved && serve_off != 0.0)
++      UTI_AddDoubleToTimespec(&ilv_transmit, serve_off, &ilv_transmit);
++
++    UTI_TimespecToNtp64(interleaved ? &ilv_transmit : &local_transmit,
+                         &message.transmit_ts, &ts_fuzz);
+ 
+     /* Do not send a packet with a non-zero transmit timestamp which is
+--- a/conf.c	2024-10-08 09:49:43.000000000 -0300
++++ b/conf.c	2026-08-22 19:41:12.336141329 -0300
+@@ -100,6 +100,9 @@
+ static char *drift_file = NULL;
+ static char *rtc_file = NULL;
+ static double max_update_skew = 1000.0;
++
++/* Bias applied to served timestamps (seconds) */
++static double serve_offset = 0.0;
+ static double correction_time_ratio = 3.0;
+ static double max_clock_error = 1.0; /* in ppm */
+ static double max_drift = 500000.0; /* in ppm */
+@@ -677,6 +680,8 @@
+     parse_double(p, &max_slew_rate);
+   } else if (!strcasecmp(command, "maxupdateskew")) {
+     parse_double(p, &max_update_skew);
++  } else if (!strcasecmp(command, "serveoffset")) {
++    parse_double(p, &serve_offset);
+   } else if (!strcasecmp(command, "minsamples")) {
+     parse_int(p, &min_samples);
+   } else if (!strcasecmp(command, "minsources")) {
+@@ -2107,6 +2112,14 @@
+ }
+ 
+ /* ================================================== */
++
++double
++CNF_GetServeOffset(void)
++{
++  return serve_offset;
++}
++
++/* ================================================== */
+ 
+ double
+ CNF_GetMaxDrift(void)
+--- a/conf.h	2024-10-08 09:49:43.000000000 -0300
++++ b/conf.h	2026-08-22 19:41:12.336264440 -0300
+@@ -96,6 +96,7 @@
+ 
+ /* Value returned in ppm, as read from file */
+ extern double CNF_GetMaxUpdateSkew(void);
++extern double CNF_GetServeOffset(void);
+ extern double CNF_GetMaxClockError(void);
+ extern double CNF_GetMaxDrift(void);
+ extern double CNF_GetCorrectionTimeRatio(void);
