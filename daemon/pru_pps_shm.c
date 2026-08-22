@@ -134,6 +134,114 @@ struct tcxo_shared {
   volatile uint32_t tsctr;
 };
 
+/* ---- T2CXO: learned DS3231 tempco ---- */
+#define T2_BINS 250 /* -40..85C, 0.5C bins */
+#define T2_TEMP_MIN (-40.0)
+#define T2_STATE "/var/lib/pru-pps-t2cxo.bin"
+#define T2_MAGIC 0x54325831u
+struct t2_state {
+  uint32_t magic;
+  float bin_ppm[T2_BINS];
+  uint16_t bin_n[T2_BINS];
+  float global_ppm;
+  uint32_t global_n;
+};
+static struct t2_state t2;
+static double t2_resid_ppm = 0.5; /* pessimistic until measured */
+static double t2_last_e = 0, t2_last_corr = 0, t2_temp_c = -1000;
+static char t2_hwmon[160];
+static int64_t t2_gps_ticks = 0;
+static uint64_t t2_gps_secs = 0;
+
+static void t2_find_hwmon(void) {
+  for (int i = 0; i < 10; i++) {
+    char path[96], name[32];
+    snprintf(path, sizeof(path), "/sys/class/hwmon/hwmon%d/name", i);
+    FILE *f = fopen(path, "r");
+    if (!f) continue;
+    int hit = fgets(name, sizeof(name), f) && !strncmp(name, "ds3231", 6);
+    fclose(f);
+    if (hit) {
+      snprintf(t2_hwmon, sizeof(t2_hwmon),
+               "/sys/class/hwmon/hwmon%d/temp1_input", i);
+      return;
+    }
+  }
+}
+
+static int t2_read_temp(double *c) {
+  if (!t2_hwmon[0]) return 0;
+  FILE *f = fopen(t2_hwmon, "r");
+  if (!f) return 0;
+  long m;
+  int ok = fscanf(f, "%ld", &m) == 1;
+  fclose(f);
+  if (ok) *c = m / 1000.0;
+  return ok;
+}
+
+static void t2_load(void) {
+  FILE *f = fopen(T2_STATE, "r");
+  if (!f) return;
+  struct t2_state in;
+  int ok = fread(&in, sizeof(in), 1, f) == 1 && in.magic == T2_MAGIC;
+  fclose(f);
+  if (ok && !(in.global_ppm > -50 && in.global_ppm < 50)) ok = 0;
+  for (int i = 0; ok && i < T2_BINS; i++)
+    if (in.bin_n[i] && !(in.bin_ppm[i] > -50 && in.bin_ppm[i] < 50)) ok = 0;
+  if (ok) {
+    t2 = in;
+    printf("t2cxo: restored %u samples\n", t2.global_n);
+  }
+}
+
+static void t2_save(void) {
+  t2.magic = T2_MAGIC;
+  FILE *f = fopen(T2_STATE ".tmp", "w");
+  if (!f) return;
+  int ok = fwrite(&t2, sizeof(t2), 1, f) == 1;
+  if (fclose(f) == 0 && ok) rename(T2_STATE ".tmp", T2_STATE);
+}
+
+static int t2_corr(double *out) {
+  if (t2_temp_c > -100) {
+    int b = (int)((t2_temp_c - T2_TEMP_MIN) * 2.0);
+    for (int r = 0; r <= 4; r++) { /* search outward to +-2C */
+      for (int sgn = -1; sgn <= 1; sgn += 2) {
+        int i = b + (sgn < 0 ? -r : r);
+        if (i >= 0 && i < T2_BINS && t2.bin_n[i] >= 5) {
+          *out = t2.bin_ppm[i];
+          return 1;
+        }
+        if (r == 0) break;
+      }
+    }
+  }
+  if (t2.global_n >= 10) {
+    *out = t2.global_ppm;
+    return 1;
+  }
+  return 0;
+}
+
+static void t2_learn(double e) {
+  if (e <= -50 || e >= 50) return; /* clamp implausible samples */
+  double c;
+  if (t2_corr(&c)) /* residual against pre-fold correction */
+    t2_resid_ppm += 0.05 * (fabs(e - c) - t2_resid_ppm);
+  if (t2.global_n == 0) t2.global_ppm = (float)e;
+  else t2.global_ppm += 0.05f * ((float)e - t2.global_ppm);
+  t2.global_n++;
+  if (t2_temp_c > -100) {
+    int b = (int)((t2_temp_c - T2_TEMP_MIN) * 2.0);
+    if (b >= 0 && b < T2_BINS) {
+      if (t2.bin_n[b] == 0) t2.bin_ppm[b] = (float)e;
+      else t2.bin_ppm[b] += 0.2f * ((float)e - t2.bin_ppm[b]);
+      if (t2.bin_n[b] < 65535) t2.bin_n[b]++;
+    }
+  }
+}
+
 /*
  * Two-stage transfer model: IEP -> MONOTONIC_RAW -> REALTIME.
  *
@@ -517,6 +625,23 @@ static void write_prom(long offset_ns, double iep_rms, double iep_slope,
     "pps_pulses_total{disposition=\"dropped\"} %u\n",
     offset_ns, adj_slew * 1e9, iep_rms, adj_rms, iep_slope, qerr,
     good, bad, dropped);
+  fprintf(f,
+    "# HELP t2cxo_err_ppm DS3231 error vs GPS, last window\n"
+    "# TYPE t2cxo_err_ppm gauge\n"
+    "t2cxo_err_ppm %.4f\n"
+    "# HELP t2cxo_corr_ppm Learned correction in use\n"
+    "# TYPE t2cxo_corr_ppm gauge\n"
+    "t2cxo_corr_ppm %.4f\n"
+    "# HELP t2cxo_residual_ppm EWMA error of the learned correction\n"
+    "# TYPE t2cxo_residual_ppm gauge\n"
+    "t2cxo_residual_ppm %.4f\n"
+    "# HELP t2cxo_samples Learned 60s windows\n"
+    "# TYPE t2cxo_samples counter\n"
+    "t2cxo_samples %u\n"
+    "# HELP ds3231_temp_celsius DS3231 die temperature\n"
+    "# TYPE ds3231_temp_celsius gauge\n"
+    "ds3231_temp_celsius %.2f\n",
+    t2_last_e, t2_last_corr, t2_resid_ppm, t2.global_n, t2_temp_c);
   if (fclose(f) != 0) { unlink(tmp); return; }
   if (rename(tmp, PROM_PATH) != 0) unlink(tmp);
 }
@@ -620,6 +745,9 @@ int main(int argc, char **argv) {
          rpmsg_dev, shmunit, sizeof(struct shmTime), qerr_sign);
   printf("Initial PRU seq=%u\n", last_seq);
 
+  t2_find_hwmon();
+  t2_load();
+
   char rpmsg_buf[32];
   struct cal_fit iepfit = {0}, adjfit = {0};
   int gpsd_fd = gpsd_connect();
@@ -702,20 +830,48 @@ int main(int argc, char **argv) {
              * window measured after daemon start; chrony re-absorbs the
              * baseline into its drift estimate on every restart.
              */
+            /* learn TCXO error when GPS covered window */
+            if (!t2_read_temp(&t2_temp_c))
+              t2_temp_c = -1000;
+            static int64_t t2_ref_ticks;
+            static uint64_t t2_ref_secs;
+            static int t2_win_have = 0;
+            static uint32_t t2_wins = 0, t2_saved_n = 0;
+            uint64_t t2_dsec = t2_gps_secs - t2_ref_secs;
+            int64_t t2_dticks = t2_gps_ticks - t2_ref_ticks;
+            if (t2_win_have && (double)t2_dsec > 0.9 * sec_tcxo &&
+                (double)t2_dsec < 1.1 * sec_tcxo) {
+              double gps_ppm =
+                  ((double)t2_dticks / (double)t2_dsec / 200e6 - 1.0) * 1e6;
+              t2_last_e = ppm - gps_ppm;
+              t2_learn(t2_last_e);
+            }
+            t2_ref_ticks = t2_gps_ticks;
+            t2_ref_secs = t2_gps_secs;
+            t2_win_have = 1;
+            double t2_c = 0;
+            t2_last_corr = t2_corr(&t2_c) ? t2_c : 0;
+            /* corrected: TCXO error learned out */
+            double corrected = ppm - t2_last_corr;
             static double base_ppm;
             static int have_base = 0;
             if (!have_base) {
-              base_ppm = ppm;
+              base_ppm = corrected;
               have_base = 1;
             }
-            printf("tcxo: timebase %+0.3f ppm vs DS3231, dev %+0.3f "
-                   "(%.0f s window)\n",
-                   ppm, ppm - base_ppm, sec_tcxo);
+            printf("tcxo: timebase %+0.3f ppm vs DS3231, e %+0.3f corr %+0.3f "
+                   "resid %.3f n=%u temp %.2f dev %+0.3f (%.0f s window)\n",
+                   ppm, t2_last_e, t2_last_corr, t2_resid_ppm, t2.global_n,
+                   t2_temp_c, corrected - base_ppm, sec_tcxo);
             FILE *pf = fopen("/run/pps-tcxo-ppm.tmp", "w");
             if (pf) {
-              fprintf(pf, "%.3f\n", ppm - base_ppm);
+              fprintf(pf, "%.3f\n", corrected - base_ppm);
               fclose(pf);
               rename("/run/pps-tcxo-ppm.tmp", "/run/pps-tcxo-ppm");
+            }
+            if (++t2_wins % 60 == 0 && t2.global_n >= t2_saved_n + 10) {
+              t2_save(); /* hourly, if learning */
+              t2_saved_n = t2.global_n;
             }
             tq_ref_ext = tq_tsctr_ext;
             tq_ref_edges = tq_edges_tot;
@@ -933,6 +1089,8 @@ int main(int argc, char **argv) {
         prev_pps_ext = pps_ext;
         continue;
       }
+      t2_gps_ticks += delta; /* per-second timebase truth */
+      t2_gps_secs++;
     } else {
       have_prev = 1;
       prev_pps_ext = pps_ext;
