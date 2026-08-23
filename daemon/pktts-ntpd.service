@@ -1,0 +1,13 @@
+[Unit]
+Description=NTP server with PRU-assisted packet timestamps
+After=pru-pps-shm.service chrony.service
+Requires=chrony.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/pktts_ntpd
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
