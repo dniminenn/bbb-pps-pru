@@ -12,7 +12,7 @@ ExecStartPre=/bin/sh -c 'echo am335x-pru1-fw-pktts > /sys/class/remoteproc/remot
 ExecStartPre=/bin/sh -c 'echo start > /sys/class/remoteproc/remoteproc2/state'
 ExecStartPre=/bin/sleep 1
 ExecStart=/sbin/insmod /home/jr/pruts/ptp_pruss.ko
-ExecStart=/sbin/insmod /home/jr/pruts/cpsw_pruts.ko
+ExecStart=/sbin/insmod /home/jr/pruts/cpsw_pruts.ko vlanif=eth0.71
 ExecStop=/sbin/rmmod cpsw_pruts
 ExecStop=/sbin/rmmod ptp_pruss
 

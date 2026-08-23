@@ -13,4 +13,4 @@ systemd-run --collect --unit=pruts-deadman sh -c '
   rmmod cpsw_pruts 2>/dev/null
   ip link set eth0 down; sleep 1; ip link set eth0 up
 '
-insmod ./cpsw_pruts.ko
+insmod ./cpsw_pruts.ko vlanif=eth0.71

@@ -36,6 +36,9 @@
 
 static char *ifname = "eth0";
 module_param(ifname, charp, 0444);
+static char *vlanif = "";
+module_param(vlanif, charp, 0444);
+MODULE_PARM_DESC(vlanif, "vlan child to rx-hook: vlan_do_receive runs before rx handlers, the parent hook never sees tagged frames");
 static unsigned int rx_match, rx_miss;
 static unsigned int tx_match, tx_miss, tx_resync;
 static unsigned int klat_ns = 60000;
@@ -46,7 +49,7 @@ module_param(tx_miss, uint, 0444);
 module_param(tx_resync, uint, 0444);
 module_param(klat_ns, uint, 0444);
 
-static struct net_device *ndev;
+static struct net_device *ndev, *vdev;
 static void __iomem *ring_io, *ecap_io, *stats_io;
 static const struct net_device_ops *orig_ndo;
 static const struct ethtool_ops *orig_eto;
@@ -375,7 +378,7 @@ static int __init pruts_init(void)
 	}
 	if (ndev->real_num_tx_queues != 1) {
 		err = -EOPNOTSUPP;
-		goto put;
+		goto putv;
 	}
 	seen_seq = readl(ring_io + PK_SEQ);
 	txg_base = readl(stats_io + TXGOOD_OFF);
@@ -391,11 +394,25 @@ static int __init pruts_init(void)
 
 	INIT_DELAYED_WORK(&txwork, txwork_fn);
 
+	if (vlanif[0]) {
+		vdev = dev_get_by_name(&init_net, vlanif);
+		if (!vdev)
+			pr_warn("cpsw_pruts: vlanif %s not found\n", vlanif);
+	}
+
 	rtnl_lock();
 	err = netdev_rx_handler_register(ndev, pruts_rx, NULL);
 	if (err) {
 		rtnl_unlock();
-		goto put;
+		goto putv;
+	}
+	if (vdev) {
+		err = netdev_rx_handler_register(vdev, pruts_rx, NULL);
+		if (err) {
+			netdev_rx_handler_unregister(ndev);
+			rtnl_unlock();
+			goto putv;
+		}
 	}
 	ndev->netdev_ops = &pruts_ndo;
 	ndev->ethtool_ops = &pruts_eto;
@@ -405,7 +422,9 @@ static int __init pruts_init(void)
 	pr_info("cpsw_pruts: hooked %s, phc index %d\n", ifname,
 		ptp_pruss_phc_index());
 	return 0;
-put:
+putv:
+	if (vdev)
+		dev_put(vdev);
 	dev_put(ndev);
 unmap:
 	if (ring_io)
@@ -423,6 +442,8 @@ static void __exit pruts_exit(void)
 	ndev->netdev_ops = orig_ndo;
 	ndev->ethtool_ops = orig_eto;
 	netdev_rx_handler_unregister(ndev);
+	if (vdev)
+		netdev_rx_handler_unregister(vdev);
 	rtnl_unlock();
 	synchronize_net();
 	WRITE_ONCE(dying, true);
@@ -430,6 +451,8 @@ static void __exit pruts_exit(void)
 	cancel_delayed_work_sync(&txwork);
 	while (txq_r != txq_w)
 		kfree_skb(txq[txq_r++ & (TXQ - 1)].skb);
+	if (vdev)
+		dev_put(vdev);
 	dev_put(ndev);
 	iounmap(ring_io);
 	iounmap(ecap_io);
