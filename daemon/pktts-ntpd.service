@@ -6,6 +6,8 @@ Requires=chrony.service
 [Service]
 Type=simple
 ExecStart=/usr/local/bin/pktts_ntpd -c 43420
+RuntimeDirectory=pruts
+RuntimeDirectoryPreserve=yes
 Restart=always
 RestartSec=2
 

@@ -304,7 +304,7 @@ static void serve(int fd) {
 }
 
 static void write_prom(void) {
-  FILE *f = fopen("/run/ts2phc/pktts.prom.tmp", "w");
+  FILE *f = fopen("/run/pruts/pktts.prom.tmp", "w");
   if (!f) return;
   fprintf(f,
     "# HELP pktts_served_total NTP replies served\n"
@@ -323,7 +323,7 @@ static void write_prom(void) {
     "# TYPE pktts_fit_valid gauge\npktts_fit_valid %d\n",
     g_served, g_match, g_fallback, g_ambig, klat_ns, egress_ns, fit_valid);
   fclose(f);
-  rename("/run/ts2phc/pktts.prom.tmp", "/run/ts2phc/pktts.prom");
+  rename("/run/pruts/pktts.prom.tmp", "/run/pruts/pktts.prom");
 }
 
 int main(int argc, char **argv) {

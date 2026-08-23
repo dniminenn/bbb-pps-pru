@@ -591,7 +591,7 @@ static int pend_head = 0, pend_count = 0;
  * partial file. Called from the existing report point so it adds no new I/O
  * cadence to the capture loop.
  */
-#define PROM_PATH "/run/ts2phc/iep.prom"
+#define PROM_PATH "/run/pruts/iep.prom"
 static void write_prom(long offset_ns, double iep_rms, double iep_slope,
                        double adj_rms, double adj_slew, double qerr,
                        unsigned good, unsigned bad, unsigned dropped) {
@@ -602,12 +602,12 @@ static void write_prom(long offset_ns, double iep_rms, double iep_slope,
   FILE* f = fdopen(fd, "w");
   if (!f) { close(fd); unlink(tmp); return; }
   fprintf(f,
-    "# HELP ts2phc_offset_ns PPS offset against the capture clock, nanoseconds\n"
-    "# TYPE ts2phc_offset_ns gauge\n"
-    "ts2phc_offset_ns{clock=\"iep0\"} %ld\n"
-    "# HELP ts2phc_freq_ppb Capture-clock frequency error, parts per billion\n"
-    "# TYPE ts2phc_freq_ppb gauge\n"
-    "ts2phc_freq_ppb{clock=\"iep0\"} %.1f\n"
+    "# HELP pru_pps_offset_ns PPS offset against the capture clock, nanoseconds\n"
+    "# TYPE pru_pps_offset_ns gauge\n"
+    "pru_pps_offset_ns{clock=\"iep0\"} %ld\n"
+    "# HELP pru_pps_freq_ppb Capture-clock frequency error, parts per billion\n"
+    "# TYPE pru_pps_freq_ppb gauge\n"
+    "pru_pps_freq_ppb{clock=\"iep0\"} %.1f\n"
     "# HELP pps_fit_rms_ns Least-squares residual of each transfer fit\n"
     "# TYPE pps_fit_rms_ns gauge\n"
     "pps_fit_rms_ns{fit=\"iep\"} %.1f\n"
