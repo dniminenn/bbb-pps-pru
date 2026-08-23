@@ -81,3 +81,11 @@ cp gen/pru-pps.out /lib/firmware/am335x-pru0-fw
 The remoteproc driver loads `/lib/firmware/am335x-pru0-fw` by default for PRU0.
 
 [Next: Userspace Daemon & Chrony](daemon.md) | [Previous: Initial Setup & Overlays](setup.md)
+
+### main_meas_pru1.c: PRU1 CPSW poll-latency measurement
+
+Build like main.c but link with the `.pru_irq_map` output section removed from a
+copy of the linker cmd (the empty COPY section fails remoteproc's loader) and no
+rpmsg lib. Measured on chron: 225 ns typical CPSW stats read from the PRU, 604 ns
+full rx+tx poll loop, 20 ns local TSCTR read. Groundwork for PRU-assisted packet
+timestamping (poll RXGOODFRAMES/TXGOODFRAMES, latch shared TSCTR per tick).
