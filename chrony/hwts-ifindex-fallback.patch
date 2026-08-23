@@ -1,0 +1,21 @@
+ntp_io_linux: fall back to packet if_index when timestamp if_index is 0
+
+The kernel fills SCM_TIMESTAMPING_PKTINFO.if_index by resolving the
+skb napi id (put_ts_pktinfo). Drivers whose napi is not attached to
+the delivering net_device (ti cpsw uses an unregistered dummy) and
+kernels without usable busy-poll ids deliver the cmsg with if_index 0,
+which defeats the HW clock lookup and silently degrades every
+timestamp to kernel timestamps. Treat 0 as invalid and use the
+IP_PKTINFO interface instead.
+
+--- a/ntp_io_linux.c
++++ b/ntp_io_linux.c
+@@ -735,7 +735,7 @@ NIO_Linux_ProcessMessage(SCK_Message *message, NTP_Local_Address *local_addr,
+   iface = NULL;
+
+   ts_if_index = message->timestamp.if_index;
+-  if (ts_if_index == INVALID_IF_INDEX)
++  if (ts_if_index == INVALID_IF_INDEX || ts_if_index == 0)
+     ts_if_index = message->if_index;
+   l2_length = message->timestamp.l2_length;
+
