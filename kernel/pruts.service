@@ -1,0 +1,20 @@
+[Unit]
+Description=PRU pktts hardware timestamping for cpsw
+After=network.target
+Before=chrony.service
+Requires=sys-class-remoteproc-remoteproc2.device
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStartPre=/bin/sh -c 'echo stop > /sys/class/remoteproc/remoteproc2/state 2>/dev/null || true'
+ExecStartPre=/bin/sh -c 'echo am335x-pru1-fw-pktts > /sys/class/remoteproc/remoteproc2/firmware'
+ExecStartPre=/bin/sh -c 'echo start > /sys/class/remoteproc/remoteproc2/state'
+ExecStartPre=/bin/sleep 1
+ExecStart=/sbin/insmod /home/jr/pruts/ptp_pruss.ko
+ExecStart=/sbin/insmod /home/jr/pruts/cpsw_pruts.ko
+ExecStop=/sbin/rmmod cpsw_pruts
+ExecStop=/sbin/rmmod ptp_pruss
+
+[Install]
+WantedBy=multi-user.target
