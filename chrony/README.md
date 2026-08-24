@@ -52,3 +52,20 @@ sudo rm /usr/sbin/chronyd
 sudo dpkg-divert --rename --remove /usr/sbin/chronyd
 sudo systemctl restart chrony
 ```
+
+## refclock: PPS via PHC extts
+
+`ptp_pruss` exposes the eCAP PPS capture as extts channel 0, so chrony reads
+the hardware pulse on its own PHC-system model:
+
+```
+refclock PHC /dev/ptp1:extpps:pin=-1 refid PPS precision 1e-9 poll 1 prefer trust lock GPS offset -0.0000047
+```
+
+`pin=-1` skips PTP_PIN_SETFUNC (the driver has no pins). The old SHM 2 feed
+from pru_pps_shm stays configured as a noselect witness (refid SHMP).
+
+Why: the SHM receive timestamps were projected through a model of chrony's own
+slewing, a feedback loop that rang microseconds under CPU load bursts. The
+extts path has no userspace middleman. Measured through a 90 s full-CPU burst:
+88 ns rms, worst sample 424 ns, zero samples past 500 ns.
