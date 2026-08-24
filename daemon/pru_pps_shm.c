@@ -765,7 +765,12 @@ int main(int argc, char **argv) {
   int qerr_sign = 0; /* -1/+1 apply, 0 = log-only (sign experiment) */
   int opt;
 
-  while ((opt = getopt(argc, argv, "s:r:q:")) != -1) {
+  /* antenna + capture chain delay; chrony.conf compensates the same
+   * constant on the SHM refclock (offset -0.0000047), recalibrate both
+   * together */
+  long pps_delay_ns = 4700;
+
+  while ((opt = getopt(argc, argv, "s:r:q:o:")) != -1) {
     switch (opt) {
     case 's':
       shmunit = atoi(optarg);
@@ -776,8 +781,13 @@ int main(int argc, char **argv) {
     case 'q':
       qerr_sign = atoi(optarg);
       break;
+    case 'o':
+      pps_delay_ns = atol(optarg);
+      break;
     default:
-      fprintf(stderr, "Usage: %s [-s shmunit] [-r rpmsg_dev] [-q -1|0|1]\n",
+      fprintf(stderr,
+              "Usage: %s [-s shmunit] [-r rpmsg_dev] [-q -1|0|1] "
+              "[-o pps_delay_ns]\n",
               argv[0]);
       return 1;
     }
@@ -1187,7 +1197,8 @@ int main(int argc, char **argv) {
         phc_last_pulse_mono = mn_ns;
         if (kfit_valid) {
           long long cap_ns = p->pps_ext * 5 + kfit_eval(mono_edge);
-          phc_off_ns = cap_ns - (clock_sec + PHC_TAI_OFFSET_S) * 1000000000LL;
+          phc_off_ns = cap_ns - (clock_sec + PHC_TAI_OFFSET_S) * 1000000000LL -
+                       pps_delay_ns;
           /* journald stamps with slewed MONOTONIC; rebase the RAW edge */
           phc_anchor_mono_ns = mn_ns - (mr_ns - mono_edge);
           phc_freq_ppb = (kfit_b - adjfit.slope) * 1e9;
