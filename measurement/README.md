@@ -19,6 +19,17 @@ Both grandmasters sit in PTP domain 0, so BMCA elects one and that is the one
 measured, the same time any PTP consumer on this LAN would receive. The `gm`
 label carries the elected clock identity.
 
+Stamp conventions: the PRU captures frames at the trailer, i210 grandmasters
+stamp at the SFD, and at this box's 100 Mbit port one PTP event frame is
+~8.4 us on the wire. ptp4l.conf carries `ingressLatency 8400` /
+`egressLatency -8400` to move the PRU stamps onto the SFD reference plane
+(the NTP-side equivalent is chrony's rxcomp). The daemon's `-o` option is the
+PPS antenna/capture chain delay, the same constant chrony.conf compensates on
+the SHM refclock. With all of that in place the instrument reads the elected
+GM within ~0.5 us; the residual few hundred ns is an uncalibrated slice of
+the frame-length constant, not clock disagreement (the hw-stamped NTP mesh
+puts the true agreement under 100 ns).
+
 An earlier CPTS-based method (phc2sys mirroring the system clock into the CPTS
 PHC) lived here; it carried a multi-microsecond noise floor from software PHC
 reads and is retired. The original experiment it supported is written up in

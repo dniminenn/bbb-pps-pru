@@ -14,14 +14,24 @@ DIR=/run/pruts
 while :; do
   st=$(pmc -u -b 0 'GET PORT_DATA_SET' 2>/dev/null | awk '/portState/{print $2; exit}')
   gm=$(pmc -u -b 0 'GET PARENT_DATA_SET' 2>/dev/null | awk '/grandmasterIdentity/{print $2; exit}')
-  line=$(journalctl -u ptp4l -n 50 -o short-monotonic --no-pager 2>/dev/null \
-         | grep 'master offset' | tail -1)
+  # median of the recent window; a queued sync can be 50 us out on its own
+  lines=$(journalctl -u ptp4l -n 200 -o short-monotonic --no-pager 2>/dev/null \
+          | grep 'master offset' | tail -31)
+  line=$(printf '%s\n' "$lines" | tail -1)
+  med=$(printf '%s\n' "$lines" | awk '
+    { for (i = 2; i < NF; i++) if ($i == "offset") v[n++] = $(i+1) }
+    END { if (!n) exit 1; asort_manual(); print v[int(n/2)] }
+    function asort_manual(  i, j, t) {
+      for (i = 1; i < n; i++)
+        for (j = 0; j < n - i; j++)
+          if (v[j] + 0 > v[j+1] + 0) { t = v[j]; v[j] = v[j+1]; v[j+1] = t }
+    }')
   up=$(cut -d' ' -f1 /proc/uptime)
   # free_running never calibrates, so UNCALIBRATED is the steady state
   case "${st:-}" in SLAVE|UNCALIBRATED) tracking=1;; *) tracking=0;; esac
   if [ "$tracking" = 1 ] && [ -n "${gm:-}" ] && [ -n "$line" ] && \
      [ -r "$DIR/iep.prom" ]; then
-    body=$(printf '%s\n' "$line" | cat - "$DIR/iep.prom" | awk -v gm="$gm" -v up="$up" '
+    body=$(printf '%s\n' "$line" | cat - "$DIR/iep.prom" | awk -v gm="$gm" -v up="$up" -v med="$med" '
       /master offset/ {
         # ptp4l stamps the message body itself; journald receive time lags
         for (i = 2; i < NF; i++) {
@@ -40,6 +50,7 @@ while :; do
         if (up - tsync > 30) exit 1  # ptp4l gone quiet, do not publish stale
         gap = tsync - am / 1e9
         phc_at_sync = off + fq * gap  # measured post-trim PHC rate
+        if (med != "") ofm = med  # median of the window, outliers dropped
         printf "# HELP ptp_gm_offset_ns elected PTP GM minus this box GPS\n"
         printf "# TYPE ptp_gm_offset_ns gauge\n"
         printf "ptp_gm_offset_ns{gm=\"%s\"} %.0f\n", gm, phc_at_sync - ofm
