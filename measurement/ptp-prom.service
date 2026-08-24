@@ -1,0 +1,13 @@
+[Unit]
+Description=PTP measurement metrics to the pruts textfile dir
+After=ptp4l.service
+Wants=ptp4l.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/ptp-prom
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

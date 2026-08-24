@@ -1,0 +1,62 @@
+#!/bin/sh
+# Export the measure-only ptp4l state as a node_exporter textfile.
+#
+# ptp4l runs free_running on the pruss PHC, which drifts ~53 us/s, so a raw
+# offsetFromMaster is meaningless on its own and pairing it with the PPS
+# anchor needs drift correction over the pairing gap. Each sync's offset is
+# taken from the ptp4l journal line (monotonic-stamped to the ms), the PPS
+# anchor and the measured drift come from iep.prom, and:
+#   ptp_gm_offset_ns = (anchor + drift * gap) - offsetFromMaster
+# is the elected grandmaster minus this box's GPS. Residual error is
+# ms-pairing times drift (~50 ns) plus ptp4l's per-sync delay noise.
+set -u
+DIR=/run/pruts
+while :; do
+  st=$(pmc -u -b 0 'GET PORT_DATA_SET' 2>/dev/null | awk '/portState/{print $2; exit}')
+  gm=$(pmc -u -b 0 'GET PARENT_DATA_SET' 2>/dev/null | awk '/grandmasterIdentity/{print $2; exit}')
+  line=$(journalctl -u ptp4l -n 50 -o short-monotonic --no-pager 2>/dev/null \
+         | grep 'master offset' | tail -1)
+  up=$(cut -d' ' -f1 /proc/uptime)
+  # free_running never calibrates, so UNCALIBRATED is the steady state
+  case "${st:-}" in SLAVE|UNCALIBRATED) tracking=1;; *) tracking=0;; esac
+  if [ "$tracking" = 1 ] && [ -n "${gm:-}" ] && [ -n "$line" ] && \
+     [ -r "$DIR/iep.prom" ]; then
+    body=$(printf '%s\n' "$line" | cat - "$DIR/iep.prom" | awk -v gm="$gm" -v up="$up" '
+      /master offset/ {
+        # ptp4l stamps the message body itself; journald receive time lags
+        for (i = 2; i < NF; i++) {
+          if ($i == "master" && $(i+1) == "offset") {
+            tsync = $(i-1); gsub(/[\[\]]/, "", tsync)
+            ofm = $(i+2)
+          }
+          if ($i == "delay") mpd = $(i+1)
+        }
+      }
+      $1 == "pruss_phc_offset_ns"      { off = $2 }
+      $1 == "pruss_phc_anchor_mono_ns" { am = $2 }
+      $1 ~ /^pru_pps_freq_ppb/         { fq = $2 }
+      END {
+        if (tsync == "" || off == "" || am == "" || fq == "") exit 1
+        if (up - tsync > 30) exit 1  # ptp4l gone quiet, do not publish stale
+        gap = tsync - am / 1e9
+        phc_at_sync = off - fq * gap  # freq is IEP error; PHC drifts opposite
+        printf "# HELP ptp_gm_offset_ns elected PTP GM minus this box GPS\n"
+        printf "# TYPE ptp_gm_offset_ns gauge\n"
+        printf "ptp_gm_offset_ns{gm=\"%s\"} %.0f\n", gm, phc_at_sync - ofm
+        printf "# HELP ptp_offset_from_master_ns pruss PHC minus elected GM, free-running\n"
+        printf "# TYPE ptp_offset_from_master_ns gauge\n"
+        printf "ptp_offset_from_master_ns{gm=\"%s\"} %s\n", gm, ofm
+        printf "# HELP ptp_mean_path_delay_ns ptp4l path delay, last sync\n"
+        printf "# TYPE ptp_mean_path_delay_ns gauge\n"
+        printf "ptp_mean_path_delay_ns{gm=\"%s\"} %s\n", gm, mpd
+      }')
+    if [ -n "$body" ]; then
+      printf '%s\n' "$body" > "$DIR/ptp.prom.tmp" && mv "$DIR/ptp.prom.tmp" "$DIR/ptp.prom"
+    else
+      rm -f "$DIR/ptp.prom"
+    fi
+  else
+    rm -f "$DIR/ptp.prom"
+  fi
+  sleep 10
+done

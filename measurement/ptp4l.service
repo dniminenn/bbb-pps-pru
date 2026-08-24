@@ -1,0 +1,16 @@
+[Unit]
+Description=ptp4l measure-only client on the pruss PHC
+After=pruts.service network-online.target
+Requires=pruts.service
+
+[Service]
+Type=simple
+# free_running: measures offsetFromMaster, never disciplines the PHC.
+# The pruss PHC must stay untouched: chrony maps its NTP hardware
+# timestamps through it.
+ExecStart=/usr/sbin/ptp4l -f /etc/linuxptp/ptp4l.conf -i eth0 --free_running 1
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
