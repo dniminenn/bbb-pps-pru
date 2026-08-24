@@ -3,71 +3,65 @@
 #
 # ptp4l runs free_running on the pruss PHC. pru_pps_shm trims the PHC's
 # frequency to GPS (DS3231 tempco in holdover), so the residual rate is
-# ppb-class, but the pairing stays drift-corrected anyway. Each sync's
-# offset is taken from the ptp4l journal line (monotonic-stamped to the
-# ms), the PPS anchor and the measured residual rate come from iep.prom:
-#   ptp_gm_offset_ns = (anchor + drift * gap) - offsetFromMaster
-# is the elected grandmaster minus this box's GPS. Residual error is
-# ms-pairing times drift (~50 ns) plus ptp4l's per-sync delay noise.
+# ppb-class, but the pairing stays drift-corrected anyway. Sync offsets
+# stream in over ONE persistent journal follow (spawning journalctl every
+# poll measurably loaded the box and polluted the served-time stats), the
+# median of the last 31 syncs drops queued-sync outliers, and the PPS
+# anchor comes from iep.prom:
+#   ptp_gm_offset_ns = (anchor + residual_rate * gap) - median offsetFromMaster
 set -u
 DIR=/run/pruts
-while :; do
-  st=$(pmc -u -b 0 'GET PORT_DATA_SET' 2>/dev/null | awk '/portState/{print $2; exit}')
-  gm=$(pmc -u -b 0 'GET PARENT_DATA_SET' 2>/dev/null | awk '/grandmasterIdentity/{print $2; exit}')
-  # median of the recent window; a queued sync can be 50 us out on its own
-  lines=$(journalctl -u ptp4l -n 200 -o short-monotonic --no-pager 2>/dev/null \
-          | grep 'master offset' | tail -31)
-  line=$(printf '%s\n' "$lines" | tail -1)
-  med=$(printf '%s\n' "$lines" | awk '
-    { for (i = 2; i < NF; i++) if ($i == "offset") v[n++] = $(i+1) }
-    END { if (!n) exit 1; asort_manual(); print v[int(n/2)] }
-    function asort_manual(  i, j, t) {
-      for (i = 1; i < n; i++)
-        for (j = 0; j < n - i; j++)
-          if (v[j] + 0 > v[j+1] + 0) { t = v[j]; v[j] = v[j+1]; v[j+1] = t }
-    }')
-  up=$(cut -d' ' -f1 /proc/uptime)
+exec journalctl -fu ptp4l -o short-monotonic -n 40 2>/dev/null | awk -v dir="$DIR" '
+/master offset/ {
+  # ptp4l stamps the message body itself; journald receive time lags
+  for (i = 2; i < NF; i++) {
+    if ($i == "master" && $(i+1) == "offset") {
+      tsync = $(i-1); gsub(/[\[\]]/, "", tsync)
+      ring[idx % 31] = $(i+2); idx++
+    }
+    if ($i == "delay") mpd = $(i+1)
+  }
+  if (idx % 5 == 0) publish()
+}
+function publish(  n, i, j, t, v, cmd, line, st, gm, off, am, fq, gap, f) {
+  n = idx < 31 ? idx : 31
+  for (i = 0; i < n; i++) v[i] = ring[i] + 0
+  for (i = 1; i < n; i++)
+    for (j = 0; j < n - i; j++)
+      if (v[j] > v[j+1]) { t = v[j]; v[j] = v[j+1]; v[j+1] = t }
+  med = v[int(n / 2)]
+  st = ""; gm = ""
+  cmd = "pmc -u -b 0 \"GET PORT_DATA_SET\" \"GET PARENT_DATA_SET\" 2>/dev/null"
+  while ((cmd | getline line) > 0) {
+    if (line ~ /portState/) { split(line, a, " "); st = a[2] }
+    if (line ~ /grandmasterIdentity/) { split(line, a, " "); gm = a[2] }
+  }
+  close(cmd)
+  off = ""; am = ""; fq = ""
+  while ((getline line < (dir "/iep.prom")) > 0) {
+    split(line, a, " ")
+    if (a[1] == "pruss_phc_offset_ns") off = a[2]
+    if (a[1] == "pruss_phc_anchor_mono_ns") am = a[2]
+    if (a[1] == "pruss_phc_freq_ppb") fq = a[2]
+  }
+  close(dir "/iep.prom")
   # free_running never calibrates, so UNCALIBRATED is the steady state
-  case "${st:-}" in SLAVE|UNCALIBRATED) tracking=1;; *) tracking=0;; esac
-  if [ "$tracking" = 1 ] && [ -n "${gm:-}" ] && [ -n "$line" ] && \
-     [ -r "$DIR/iep.prom" ]; then
-    body=$(printf '%s\n' "$line" | cat - "$DIR/iep.prom" | awk -v gm="$gm" -v up="$up" -v med="$med" '
-      /master offset/ {
-        # ptp4l stamps the message body itself; journald receive time lags
-        for (i = 2; i < NF; i++) {
-          if ($i == "master" && $(i+1) == "offset") {
-            tsync = $(i-1); gsub(/[\[\]]/, "", tsync)
-            ofm = $(i+2)
-          }
-          if ($i == "delay") mpd = $(i+1)
-        }
-      }
-      $1 == "pruss_phc_offset_ns"      { off = $2 }
-      $1 == "pruss_phc_anchor_mono_ns" { am = $2 }
-      $1 == "pruss_phc_freq_ppb"       { fq = $2 }
-      END {
-        if (tsync == "" || off == "" || am == "" || fq == "") exit 1
-        if (up - tsync > 30) exit 1  # ptp4l gone quiet, do not publish stale
-        gap = tsync - am / 1e9
-        phc_at_sync = off + fq * gap  # measured post-trim PHC rate
-        if (med != "") ofm = med  # median of the window, outliers dropped
-        printf "# HELP ptp_gm_offset_ns elected PTP GM minus this box GPS\n"
-        printf "# TYPE ptp_gm_offset_ns gauge\n"
-        printf "ptp_gm_offset_ns{gm=\"%s\"} %.0f\n", gm, phc_at_sync - ofm
-        printf "# HELP ptp_offset_from_master_ns pruss PHC minus elected GM, free-running\n"
-        printf "# TYPE ptp_offset_from_master_ns gauge\n"
-        printf "ptp_offset_from_master_ns{gm=\"%s\"} %s\n", gm, ofm
-        printf "# HELP ptp_mean_path_delay_ns ptp4l path delay, last sync\n"
-        printf "# TYPE ptp_mean_path_delay_ns gauge\n"
-        printf "ptp_mean_path_delay_ns{gm=\"%s\"} %s\n", gm, mpd
-      }')
-    if [ -n "$body" ]; then
-      printf '%s\n' "$body" > "$DIR/ptp.prom.tmp" && mv "$DIR/ptp.prom.tmp" "$DIR/ptp.prom"
-    else
-      rm -f "$DIR/ptp.prom"
-    fi
-  else
-    rm -f "$DIR/ptp.prom"
-  fi
-  sleep 10
-done
+  if ((st != "SLAVE" && st != "UNCALIBRATED") || gm == "" || off == "" ||
+      am == "" || fq == "") {
+    system("rm -f " dir "/ptp.prom")
+    return
+  }
+  gap = tsync - am / 1e9
+  f = dir "/ptp.prom.tmp"
+  printf "# HELP ptp_gm_offset_ns elected PTP GM minus this box GPS\n" > f
+  printf "# TYPE ptp_gm_offset_ns gauge\n" > f
+  printf "ptp_gm_offset_ns{gm=\"%s\"} %.0f\n", gm, (off + fq * gap) - med > f
+  printf "# HELP ptp_offset_from_master_ns pruss PHC minus elected GM, median\n" > f
+  printf "# TYPE ptp_offset_from_master_ns gauge\n" > f
+  printf "ptp_offset_from_master_ns{gm=\"%s\"} %.0f\n", gm, med > f
+  printf "# HELP ptp_mean_path_delay_ns ptp4l path delay, last sync\n" > f
+  printf "# TYPE ptp_mean_path_delay_ns gauge\n" > f
+  printf "ptp_mean_path_delay_ns{gm=\"%s\"} %s\n", gm, mpd > f
+  close(f)
+  system("mv " f " " dir "/ptp.prom")
+}'

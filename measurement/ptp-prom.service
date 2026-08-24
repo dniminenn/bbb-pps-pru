@@ -6,6 +6,7 @@ Wants=ptp4l.service
 [Service]
 Type=simple
 ExecStart=/usr/local/bin/ptp-prom
+Nice=10
 Restart=always
 RestartSec=10
 
