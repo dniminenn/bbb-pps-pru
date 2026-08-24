@@ -7,12 +7,15 @@ Requires=sys-class-remoteproc-remoteproc2.device
 [Service]
 Type=oneshot
 RemainAfterExit=yes
+ExecStartPre=/bin/sh -c 'for i in $(seq 1 60); do [ -e /sys/class/remoteproc/remoteproc2/firmware ] && exit 0; sleep 1; done; echo remoteproc2 never appeared; exit 1'
 ExecStartPre=/bin/sh -c 'echo stop > /sys/class/remoteproc/remoteproc2/state 2>/dev/null || true'
 ExecStartPre=/bin/sh -c 'echo am335x-pru1-fw-pktts > /sys/class/remoteproc/remoteproc2/firmware'
 ExecStartPre=/bin/sh -c 'echo start > /sys/class/remoteproc/remoteproc2/state'
 ExecStartPre=/bin/sleep 1
 ExecStart=/sbin/insmod /home/jr/pruts/ptp_pruss.ko
 ExecStart=/sbin/insmod /home/jr/pruts/cpsw_pruts.ko vlanif=eth0.71
+# phc to tai, stack convention
+ExecStartPost=/bin/sh -c 'for p in /sys/class/ptp/ptp*; do grep -q pruss-ecap $p/clock_name && d=/dev/$(basename $p) && phc_ctl $d set && phc_ctl $d adj 37; done'
 ExecStop=/sbin/rmmod cpsw_pruts
 ExecStop=/sbin/rmmod ptp_pruss
 
