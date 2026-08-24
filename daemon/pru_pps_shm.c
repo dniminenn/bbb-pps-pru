@@ -5,6 +5,7 @@
  * Copyright (c) 2026 dniminenn
  */
 
+#define _GNU_SOURCE /* clock_adjtime */
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -23,6 +24,7 @@
 #include <sys/mman.h>
 #include <sys/shm.h>
 #include <sys/socket.h>
+#include <sys/timex.h>
 #include <time.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -170,12 +172,67 @@ static uint64_t t2_gps_secs = 0;
 #define PHC_TAI_OFFSET_S 37
 #define FD_TO_CLOCKID(fd) ((clockid_t)((((unsigned int)~(fd)) << 3) | 3))
 static int phc_fd = -1;
-static long long phc_k0;    /* first K sample, ns */
-static double phc_kresid;   /* EWMA of K - k0, ns */
-static int phc_k_n;
 static long long phc_off_ns;
 static long long phc_anchor_mono_ns; /* CLOCK_MONOTONIC of the anchor pulse */
 static int phc_off_valid;
+static double phc_freq_ppb; /* measured d(PHC - true)/dt after trim */
+
+/*
+ * K(t) = PHC ns minus extended ticks * 5, sampled ~1 Hz by pairing a PHC
+ * gettime with a bracketed TSCTR read. Constant while the PHC is untrimmed;
+ * our own adjfine trims put a slope on it, so it is tracked as a windowed
+ * line over MONOTONIC_RAW and the ring is flushed whenever the trim
+ * changes. Values are huge (TAI epoch), so the fit works on deltas from
+ * the window's first sample.
+ */
+#define KFIT_N 64
+static struct kent { long long t, k; } kring[KFIT_N];
+static int kring_n, kring_head;
+static double kfit_a, kfit_b; /* k = a + b*(t - t0), b in ns/ns */
+static long long kfit_t0, kfit_k0;
+static int kfit_valid;
+
+static void kring_reset(void) { kring_n = kring_head = kfit_valid = 0; }
+
+static void kring_push(long long t, long long k) {
+  kring[kring_head] = (struct kent){t, k};
+  kring_head = (kring_head + 1) % KFIT_N;
+  if (kring_n < KFIT_N)
+    kring_n++;
+  if (kring_n < 8) {
+    kfit_valid = 0;
+    return;
+  }
+  int base = (kring_head - kring_n + KFIT_N) % KFIT_N;
+  kfit_t0 = kring[base].t;
+  kfit_k0 = kring[base].k;
+  double sx = 0, sy = 0, sxx = 0, sxy = 0;
+  for (int j = 0; j < kring_n; j++) {
+    struct kent *e = &kring[(base + j) % KFIT_N];
+    double x = (double)(e->t - kfit_t0);
+    double y = (double)(e->k - kfit_k0);
+    sx += x; sy += y; sxx += x * x; sxy += x * y;
+  }
+  double det = kring_n * sxx - sx * sx;
+  if (det <= 0)
+    return;
+  kfit_b = (kring_n * sxy - sx * sy) / det;
+  kfit_a = (sy - kfit_b * sx) / kring_n;
+  kfit_valid = 1;
+}
+
+static long long kfit_eval(long long t) {
+  return kfit_k0 + (long long)(kfit_a + kfit_b * (double)(t - kfit_t0));
+}
+
+/* DS3231 absolute frequency estimate, from the tempco block */
+static double phc_ds_err_ppb;
+static long long phc_ds_mono_ns = -1;
+
+/* last commanded trim */
+static double phc_cmd_ppb;
+static int phc_cmd_set;
+static long long phc_last_pulse_mono = -1000000000000LL;
 
 static void phc_open(void) {
   for (int i = 0; i < 8; i++) {
@@ -187,7 +244,7 @@ static void phc_open(void) {
     if (fgets(name, sizeof(name), f) && !strncmp(name, "pruss-ecap", 10)) {
       fclose(f);
       snprintf(path, sizeof(path), "/dev/ptp%d", i);
-      phc_fd = open(path, O_RDONLY);
+      phc_fd = open(path, O_RDWR); /* adjfine trims need write */
       if (phc_fd >= 0)
         printf("pruss PHC found at %s\n", path);
       return;
@@ -693,8 +750,11 @@ static void write_prom(long offset_ns, double iep_rms, double iep_slope,
       "pruss_phc_offset_ns %lld\n"
       "# HELP pruss_phc_anchor_mono_ns CLOCK_MONOTONIC of the anchor pulse\n"
       "# TYPE pruss_phc_anchor_mono_ns gauge\n"
-      "pruss_phc_anchor_mono_ns %lld\n",
-      phc_off_ns, phc_anchor_mono_ns);
+      "pruss_phc_anchor_mono_ns %lld\n"
+      "# HELP pruss_phc_freq_ppb PHC rate error vs GPS after the trim\n"
+      "# TYPE pruss_phc_freq_ppb gauge\n"
+      "pruss_phc_freq_ppb %.1f\n",
+      phc_off_ns, phc_anchor_mono_ns, phc_freq_ppb);
   if (fclose(f) != 0) { unlink(tmp); return; }
   if (rename(tmp, PROM_PATH) != 0) unlink(tmp);
 }
@@ -907,6 +967,13 @@ int main(int argc, char **argv) {
             t2_last_corr = t2_corr(&t2_c) ? t2_c : 0;
             /* corrected: TCXO error learned out */
             double corrected = ppm - t2_last_corr;
+            {
+              struct timespec dm;
+              clock_gettime(CLOCK_MONOTONIC, &dm);
+              phc_ds_err_ppb = corrected * 1000.0;
+              phc_ds_mono_ns =
+                  (long long)dm.tv_sec * 1000000000LL + dm.tv_nsec;
+            }
             static double base_ppm;
             static int have_base = 0;
             if (!have_base) {
@@ -970,25 +1037,59 @@ int main(int argc, char **argv) {
     static int phc_tick = 0;
     if (phc_fd >= 0 && ++phc_tick >= 40) {
       phc_tick = 0;
-      struct timespec pt;
+      struct timespec pt, pm1, pm2;
+      clock_gettime(CLOCK_MONOTONIC_RAW, &pm1);
       uint32_t pr1 = iep[0];
       if (clock_gettime(FD_TO_CLOCKID(phc_fd), &pt) == 0) {
         uint32_t pr2 = iep[0];
+        clock_gettime(CLOCK_MONOTONIC_RAW, &pm2);
         int64_t e1 = iep_ext + (int32_t)(pr1 - iep_last_raw);
         int64_t e2 = iep_ext + (int32_t)(pr2 - iep_last_raw);
         long long pt_ns = (long long)pt.tv_sec * 1000000000LL + pt.tv_nsec;
+        long long tp =
+            ((long long)pm1.tv_sec * 1000000000LL + pm1.tv_nsec +
+             (long long)pm2.tv_sec * 1000000000LL + pm2.tv_nsec) / 2;
         long long k = pt_ns - (e1 + e2) / 2 * 5;
-        if (!phc_k_n ||
-            fabs((double)(k - phc_k0) - phc_kresid) > 1e6 /* phc stepped */) {
-          phc_k0 = k;
-          phc_kresid = 0;
-          phc_k_n = 0;
+        if (kfit_valid && fabs((double)(k - kfit_eval(tp))) > 1e6) {
+          kring_reset(); /* phc stepped */
           phc_off_valid = 0;
-        } else {
-          phc_kresid += ((double)(k - phc_k0) - phc_kresid) / 16.0;
         }
-        if (phc_k_n < 1 << 20)
-          phc_k_n++;
+        kring_push(tp, k);
+
+        /* trim the PHC frequency, ~1/min: GPS while locked, DS3231 in
+         * holdover */
+        static int trim_ctr = 0;
+        if (++trim_ctr >= 64) {
+          trim_ctr = 0;
+          double target = 0;
+          const char *src = NULL;
+          long long now_mono;
+          struct timespec tn;
+          clock_gettime(CLOCK_MONOTONIC, &tn);
+          now_mono = (long long)tn.tv_sec * 1000000000LL + tn.tv_nsec;
+          if (adjfit.valid &&
+              now_mono - phc_last_pulse_mono < 30000000000LL) {
+            target = adjfit.slope * 1e9;
+            src = "gps";
+          } else if (phc_ds_mono_ns >= 0 &&
+                     now_mono - phc_ds_mono_ns < 600000000000LL) {
+            target = -phc_ds_err_ppb;
+            src = "ds3231";
+          }
+          if (src && (!phc_cmd_set || fabs(target - phc_cmd_ppb) > 5)) {
+            struct timex tx = {0};
+            tx.modes = ADJ_FREQUENCY;
+            tx.freq = (long)llround(target * 65.536);
+            if (clock_adjtime(FD_TO_CLOCKID(phc_fd), &tx) != -1) {
+              phc_cmd_ppb = target;
+              phc_cmd_set = 1;
+              kring_reset(); /* slope knee */
+              printf("phc trim %+.0f ppb (%s)\n", target, src);
+            } else {
+              perror("clock_adjtime(phc)");
+            }
+          }
+        }
       }
     }
 
@@ -1077,17 +1178,21 @@ int main(int argc, char **argv) {
       if (rx_nsec >= 500000000L)
         clock_sec++;
 
-      if (phc_k_n) {
-        long long cap_ns = p->pps_ext * 5 + phc_k0 + (long long)phc_kresid;
-        phc_off_ns = cap_ns - (clock_sec + PHC_TAI_OFFSET_S) * 1000000000LL;
-        /* journald stamps with slewed MONOTONIC; rebase the RAW edge */
+      {
         struct timespec mn, mr;
         clock_gettime(CLOCK_MONOTONIC, &mn);
         clock_gettime(CLOCK_MONOTONIC_RAW, &mr);
-        phc_anchor_mono_ns =
-            (long long)mn.tv_sec * 1000000000LL + mn.tv_nsec -
-            ((long long)mr.tv_sec * 1000000000LL + mr.tv_nsec - mono_edge);
-        phc_off_valid = 1;
+        long long mn_ns = (long long)mn.tv_sec * 1000000000LL + mn.tv_nsec;
+        long long mr_ns = (long long)mr.tv_sec * 1000000000LL + mr.tv_nsec;
+        phc_last_pulse_mono = mn_ns;
+        if (kfit_valid) {
+          long long cap_ns = p->pps_ext * 5 + kfit_eval(mono_edge);
+          phc_off_ns = cap_ns - (clock_sec + PHC_TAI_OFFSET_S) * 1000000000LL;
+          /* journald stamps with slewed MONOTONIC; rebase the RAW edge */
+          phc_anchor_mono_ns = mn_ns - (mr_ns - mono_edge);
+          phc_freq_ppb = (kfit_b - adjfit.slope) * 1e9;
+          phc_off_valid = 1;
+        }
       }
 
       /*

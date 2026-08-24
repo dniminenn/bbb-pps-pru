@@ -1,11 +1,11 @@
 #!/bin/sh
 # Export the measure-only ptp4l state as a node_exporter textfile.
 #
-# ptp4l runs free_running on the pruss PHC, which drifts ~53 us/s, so a raw
-# offsetFromMaster is meaningless on its own and pairing it with the PPS
-# anchor needs drift correction over the pairing gap. Each sync's offset is
-# taken from the ptp4l journal line (monotonic-stamped to the ms), the PPS
-# anchor and the measured drift come from iep.prom, and:
+# ptp4l runs free_running on the pruss PHC. pru_pps_shm trims the PHC's
+# frequency to GPS (DS3231 tempco in holdover), so the residual rate is
+# ppb-class, but the pairing stays drift-corrected anyway. Each sync's
+# offset is taken from the ptp4l journal line (monotonic-stamped to the
+# ms), the PPS anchor and the measured residual rate come from iep.prom:
 #   ptp_gm_offset_ns = (anchor + drift * gap) - offsetFromMaster
 # is the elected grandmaster minus this box's GPS. Residual error is
 # ms-pairing times drift (~50 ns) plus ptp4l's per-sync delay noise.
@@ -34,12 +34,12 @@ while :; do
       }
       $1 == "pruss_phc_offset_ns"      { off = $2 }
       $1 == "pruss_phc_anchor_mono_ns" { am = $2 }
-      $1 ~ /^pru_pps_freq_ppb/         { fq = $2 }
+      $1 == "pruss_phc_freq_ppb"       { fq = $2 }
       END {
         if (tsync == "" || off == "" || am == "" || fq == "") exit 1
         if (up - tsync > 30) exit 1  # ptp4l gone quiet, do not publish stale
         gap = tsync - am / 1e9
-        phc_at_sync = off - fq * gap  # freq is IEP error; PHC drifts opposite
+        phc_at_sync = off + fq * gap  # measured post-trim PHC rate
         printf "# HELP ptp_gm_offset_ns elected PTP GM minus this box GPS\n"
         printf "# TYPE ptp_gm_offset_ns gauge\n"
         printf "ptp_gm_offset_ns{gm=\"%s\"} %.0f\n", gm, phc_at_sync - ofm

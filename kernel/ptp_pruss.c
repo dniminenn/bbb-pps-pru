@@ -1,11 +1,10 @@
 // SPDX-License-Identifier: GPL-2.0
-/* ptp_pruss: ICSS eCAP TSCTR exposed as a PHC, free-running in rate.
- * PHC time = 64-bit extended tick count * 5 ns + a settable phase base
- * (settime/adjtime, so the timescale can be placed at TAI once at boot).
- * Frequency is deliberately not adjustable; consumers relate the clock to
- * system time themselves (chrony hwtimestamp, ptp4l), like any NIC PHC.
- * The base flows through ticks_to_ns so packet stamps and the PHC stay
- * one timescale.
+/* ptp_pruss: ICSS eCAP TSCTR exposed as a PHC.
+ * PHC time = 64-bit extended tick count * 5 ns, phase-settable
+ * (settime/adjtime, placed at TAI once at boot) and frequency-trimmable
+ * (adjfine, 1 ppb resolution; pru_pps_shm trims it to GPS, or to the
+ * DS3231 tempco model in holdover). Phase and trim flow through
+ * ticks_to_ns so packet stamps and the PHC stay one timescale.
  */
 #include <linux/io.h>
 #include <linux/kernel.h>
@@ -22,22 +21,34 @@ static struct ptp_clock *clk;
 static spinlock_t lock;
 static u64 ext_ticks;
 static s64 base_ns;
+static u64 fold_ticks;
+static s32 freq_ppb;
+static s64 freq_carry; /* sub-ns remainder across folds */
 static u32 last_raw;
 static struct delayed_work unwrap_work;
 
-static u64 pruss_ticks_now(void)
+/* ns on the trimmed timescale; caller holds lock */
+static u64 scaled_ns(u64 ticks)
 {
-	unsigned long fl;
-	u32 raw;
-	u64 t;
+	s64 d = (s64)(ticks - fold_ticks);
 
-	spin_lock_irqsave(&lock, fl);
-	raw = readl(ecap);
-	ext_ticks += (s32)(raw - last_raw);
-	last_raw = raw;
-	t = ext_ticks;
-	spin_unlock_irqrestore(&lock, fl);
-	return t;
+	return base_ns + d * TICK_NS +
+	       div_s64(d * TICK_NS * freq_ppb + freq_carry, NSEC_PER_SEC);
+}
+
+/* materialise the scaled interval into the base; caller holds lock.
+ * Called from every adjustment and from the unwrap worker, so the
+ * d * ppb product never grows anywhere near overflow. */
+static void fold(void)
+{
+	s64 d = (s64)(ext_ticks - fold_ticks);
+	s32 rem;
+
+	base_ns += d * TICK_NS +
+		   div_s64_rem(d * TICK_NS * freq_ppb + freq_carry,
+			       NSEC_PER_SEC, &rem);
+	freq_carry = rem;
+	fold_ticks = ext_ticks;
 }
 
 static u64 pruss_ns_now(void)
@@ -50,7 +61,7 @@ static u64 pruss_ns_now(void)
 	raw = readl(ecap);
 	ext_ticks += (s32)(raw - last_raw);
 	last_raw = raw;
-	ns = ext_ticks * TICK_NS + base_ns;
+	ns = scaled_ns(ext_ticks);
 	spin_unlock_irqrestore(&lock, fl);
 	return ns;
 }
@@ -71,12 +82,12 @@ EXPORT_SYMBOL_GPL(ptp_pruss_extend);
 u64 ptp_pruss_ticks_to_ns(u64 ticks)
 {
 	unsigned long fl;
-	s64 b;
+	u64 ns;
 
 	spin_lock_irqsave(&lock, fl);
-	b = base_ns;
+	ns = scaled_ns(ticks);
 	spin_unlock_irqrestore(&lock, fl);
-	return ticks * TICK_NS + b;
+	return ns;
 }
 EXPORT_SYMBOL_GPL(ptp_pruss_ticks_to_ns);
 
@@ -88,7 +99,15 @@ EXPORT_SYMBOL_GPL(ptp_pruss_phc_index);
 
 static void unwrap_fn(struct work_struct *w)
 {
-	pruss_ticks_now(); /* keep extension alive */
+	unsigned long fl;
+	u32 raw;
+
+	spin_lock_irqsave(&lock, fl);
+	raw = readl(ecap);
+	ext_ticks += (s32)(raw - last_raw);
+	last_raw = raw;
+	fold(); /* keep extension alive and the scaled interval small */
+	spin_unlock_irqrestore(&lock, fl);
 	schedule_delayed_work(&unwrap_work, HZ * 5);
 }
 
@@ -113,13 +132,25 @@ static int pp_settime(struct ptp_clock_info *i, const struct timespec64 *ts)
 	raw = readl(ecap);
 	ext_ticks += (s32)(raw - last_raw);
 	last_raw = raw;
-	base_ns = timespec64_to_ns(ts) - (s64)(ext_ticks * TICK_NS);
+	fold_ticks = ext_ticks;
+	freq_carry = 0;
+	base_ns = timespec64_to_ns(ts);
 	spin_unlock_irqrestore(&lock, fl);
 	return 0;
 }
-static int pp_nope_adjfine(struct ptp_clock_info *i, long ppm)
+static int pp_adjfine(struct ptp_clock_info *i, long scaled_ppm)
 {
-	return -EOPNOTSUPP;
+	unsigned long fl;
+	u32 raw;
+
+	spin_lock_irqsave(&lock, fl);
+	raw = readl(ecap);
+	ext_ticks += (s32)(raw - last_raw);
+	last_raw = raw;
+	fold();
+	freq_ppb = (s32)div_s64((s64)scaled_ppm * 1000, 65536);
+	spin_unlock_irqrestore(&lock, fl);
+	return 0;
 }
 static int pp_adjtime(struct ptp_clock_info *i, s64 d)
 {
@@ -134,10 +165,10 @@ static int pp_adjtime(struct ptp_clock_info *i, s64 d)
 static struct ptp_clock_info pp_info = {
 	.owner = THIS_MODULE,
 	.name = "pruss-ecap",
-	.max_adj = 0,
+	.max_adj = 100000,
 	.gettimex64 = pp_gettimex,
 	.settime64 = pp_settime,
-	.adjfine = pp_nope_adjfine,
+	.adjfine = pp_adjfine,
 	.adjtime = pp_adjtime,
 };
 
