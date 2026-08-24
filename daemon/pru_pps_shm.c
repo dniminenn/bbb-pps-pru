@@ -153,6 +153,50 @@ static char t2_hwmon[160];
 static int64_t t2_gps_ticks = 0;
 static uint64_t t2_gps_secs = 0;
 
+/*
+ * pruss PHC bookkeeping: the kernel PHC (ptp_pruss) counts the same eCAP
+ * TSCTR this daemon reads, times 5 ns, from its own epoch. The constant K
+ * between the two extended counts is learned by pairing a PHC gettime with a
+ * bracketed TSCTR read; K in ticks never changes, so the residual is EWMAd
+ * hard. With K known, the PHC's time at a PPS capture is exact (the capture
+ * is hardware), and PHC minus the pulse's true second is the PHC's error
+ * against GPS: the anchor that turns a free-running ptp4l offsetFromMaster
+ * into a GM-vs-GPS measurement. Kept in int64: 2026 epoch nanoseconds round
+ * at ~256 ns in a double.
+ *
+ * PHC_TAI_OFFSET_S: pruts.service sets the PHC to TAI at boot; 37 is the
+ * stack-wide convention (phc2sys -O 37, chrony PHC offset -37).
+ */
+#define PHC_TAI_OFFSET_S 37
+#define FD_TO_CLOCKID(fd) ((clockid_t)((((unsigned int)~(fd)) << 3) | 3))
+static int phc_fd = -1;
+static long long phc_k0;    /* first K sample, ns */
+static double phc_kresid;   /* EWMA of K - k0, ns */
+static int phc_k_n;
+static long long phc_off_ns;
+static long long phc_anchor_mono_ns; /* CLOCK_MONOTONIC of the anchor pulse */
+static int phc_off_valid;
+
+static void phc_open(void) {
+  for (int i = 0; i < 8; i++) {
+    char path[64], name[32];
+    snprintf(path, sizeof(path), "/sys/class/ptp/ptp%d/clock_name", i);
+    FILE *f = fopen(path, "r");
+    if (!f)
+      continue;
+    if (fgets(name, sizeof(name), f) && !strncmp(name, "pruss-ecap", 10)) {
+      fclose(f);
+      snprintf(path, sizeof(path), "/dev/ptp%d", i);
+      phc_fd = open(path, O_RDONLY);
+      if (phc_fd >= 0)
+        printf("pruss PHC found at %s\n", path);
+      return;
+    }
+    fclose(f);
+  }
+  fprintf(stderr, "pru_pps_shm: no pruss-ecap PHC, phc offset export off\n");
+}
+
 static void t2_find_hwmon(void) {
   for (int i = 0; i < 10; i++) {
     char path[96], name[32];
@@ -642,6 +686,15 @@ static void write_prom(long offset_ns, double iep_rms, double iep_slope,
     "# TYPE ds3231_temp_celsius gauge\n"
     "ds3231_temp_celsius %.2f\n",
     t2_last_e, t2_last_corr, t2_resid_ppm, t2.global_n, t2_temp_c);
+  if (phc_off_valid)
+    fprintf(f,
+      "# HELP pruss_phc_offset_ns pruss PHC minus GPS time (TAI) at the PPS capture\n"
+      "# TYPE pruss_phc_offset_ns gauge\n"
+      "pruss_phc_offset_ns %lld\n"
+      "# HELP pruss_phc_anchor_mono_ns CLOCK_MONOTONIC of the anchor pulse\n"
+      "# TYPE pruss_phc_anchor_mono_ns gauge\n"
+      "pruss_phc_anchor_mono_ns %lld\n",
+      phc_off_ns, phc_anchor_mono_ns);
   if (fclose(f) != 0) { unlink(tmp); return; }
   if (rename(tmp, PROM_PATH) != 0) unlink(tmp);
 }
@@ -747,6 +800,7 @@ int main(int argc, char **argv) {
 
   t2_find_hwmon();
   t2_load();
+  phc_open();
 
   char rpmsg_buf[32];
   struct cal_fit iepfit = {0}, adjfit = {0};
@@ -912,6 +966,32 @@ int main(int argc, char **argv) {
     if (m2 - m1 < CAL_SPREAD_GATE_NS)
       cal_push(iep_ext, m1 + (m2 - m1) / 2);
 
+    /* pair the kernel PHC with a bracketed TSCTR read, ~1 Hz */
+    static int phc_tick = 0;
+    if (phc_fd >= 0 && ++phc_tick >= 40) {
+      phc_tick = 0;
+      struct timespec pt;
+      uint32_t pr1 = iep[0];
+      if (clock_gettime(FD_TO_CLOCKID(phc_fd), &pt) == 0) {
+        uint32_t pr2 = iep[0];
+        int64_t e1 = iep_ext + (int32_t)(pr1 - iep_last_raw);
+        int64_t e2 = iep_ext + (int32_t)(pr2 - iep_last_raw);
+        long long pt_ns = (long long)pt.tv_sec * 1000000000LL + pt.tv_nsec;
+        long long k = pt_ns - (e1 + e2) / 2 * 5;
+        if (!phc_k_n ||
+            fabs((double)(k - phc_k0) - phc_kresid) > 1e6 /* phc stepped */) {
+          phc_k0 = k;
+          phc_kresid = 0;
+          phc_k_n = 0;
+          phc_off_valid = 0;
+        } else {
+          phc_kresid += ((double)(k - phc_k0) - phc_kresid) / 16.0;
+        }
+        if (phc_k_n < 1 << 20)
+          phc_k_n++;
+      }
+    }
+
     /* chrony's cumulative adjustment, REALTIME - MONOTONIC_RAW */
     clock_gettime(CLOCK_MONOTONIC_RAW, &t1);
     clock_gettime(CLOCK_REALTIME, &t3);
@@ -996,6 +1076,19 @@ int main(int argc, char **argv) {
       long long clock_sec = rx_sec;
       if (rx_nsec >= 500000000L)
         clock_sec++;
+
+      if (phc_k_n) {
+        long long cap_ns = p->pps_ext * 5 + phc_k0 + (long long)phc_kresid;
+        phc_off_ns = cap_ns - (clock_sec + PHC_TAI_OFFSET_S) * 1000000000LL;
+        /* journald stamps with slewed MONOTONIC; rebase the RAW edge */
+        struct timespec mn, mr;
+        clock_gettime(CLOCK_MONOTONIC, &mn);
+        clock_gettime(CLOCK_MONOTONIC_RAW, &mr);
+        phc_anchor_mono_ns =
+            (long long)mn.tv_sec * 1000000000LL + mn.tv_nsec -
+            ((long long)mr.tv_sec * 1000000000LL + mr.tv_nsec - mono_edge);
+        phc_off_valid = 1;
+      }
 
       /*
        * Sawtooth correction: apply the TIM-TP qErr whose GPS-derived second
