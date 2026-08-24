@@ -5,6 +5,12 @@
  * (adjfine, 1 ppb resolution; pru_pps_shm trims it to GPS, or to the
  * DS3231 tempco model in holdover). Phase and trim flow through
  * ticks_to_ns so packet stamps and the PHC stay one timescale.
+ *
+ * The eCAP CAP1 register latches the GPS PPS rising edge in silicon; it is
+ * exposed as extts channel 0 (chrony: refclock PHC :extpps), which hands
+ * chrony the hardware pulse on its own PHC-system model with no userspace
+ * middleman. The PRU firmware owns the eCAP event flags; this module only
+ * watches CAP1 for value changes and must never write ECFLG/ECCLR.
  */
 #include <linux/io.h>
 #include <linux/kernel.h>
@@ -14,6 +20,7 @@
 #include <linux/workqueue.h>
 
 #define ECAP_PHYS 0x4A330000
+#define CAP1_OFF 0x08
 #define TICK_NS 5
 
 static void __iomem *ecap;
@@ -25,6 +32,8 @@ static u64 fold_ticks;
 static s32 freq_ppb;
 static s64 freq_carry; /* sub-ns remainder across folds */
 static u32 last_raw;
+static bool extts_on;
+static u32 last_cap1;
 static struct delayed_work unwrap_work;
 
 /* ns on the trimmed timescale; caller holds lock */
@@ -100,15 +109,27 @@ EXPORT_SYMBOL_GPL(ptp_pruss_phc_index);
 static void unwrap_fn(struct work_struct *w)
 {
 	unsigned long fl;
-	u32 raw;
+	u32 raw, cap;
+	bool fire = false;
+	struct ptp_clock_event ev;
 
 	spin_lock_irqsave(&lock, fl);
 	raw = readl(ecap);
 	ext_ticks += (s32)(raw - last_raw);
 	last_raw = raw;
 	fold(); /* keep extension alive and the scaled interval small */
+	cap = readl(ecap + CAP1_OFF);
+	if (extts_on && cap != last_cap1) {
+		ev.type = PTP_CLOCK_EXTTS;
+		ev.index = 0;
+		ev.timestamp = scaled_ns(ext_ticks + (s32)(cap - last_raw));
+		fire = true;
+	}
+	last_cap1 = cap;
 	spin_unlock_irqrestore(&lock, fl);
-	schedule_delayed_work(&unwrap_work, HZ * 5);
+	if (fire)
+		ptp_clock_event(clk, &ev);
+	schedule_delayed_work(&unwrap_work, HZ / 4);
 }
 
 static int pp_gettimex(struct ptp_clock_info *i, struct timespec64 *ts,
@@ -162,14 +183,33 @@ static int pp_adjtime(struct ptp_clock_info *i, s64 d)
 	return 0;
 }
 
+static int pp_enable(struct ptp_clock_info *i, struct ptp_clock_request *rq,
+		     int on)
+{
+	unsigned long fl;
+
+	if (rq->type != PTP_CLK_REQ_EXTTS || rq->extts.index != 0)
+		return -EOPNOTSUPP;
+	/* CAP1 is wired rising-only in the PRU's eCAP setup */
+	if (on && (rq->extts.flags & PTP_FALLING_EDGE))
+		return -EOPNOTSUPP;
+	spin_lock_irqsave(&lock, fl);
+	last_cap1 = readl(ecap + CAP1_OFF); /* never fire a stale capture */
+	extts_on = on;
+	spin_unlock_irqrestore(&lock, fl);
+	return 0;
+}
+
 static struct ptp_clock_info pp_info = {
 	.owner = THIS_MODULE,
 	.name = "pruss-ecap",
 	.max_adj = 100000,
+	.n_ext_ts = 1,
 	.gettimex64 = pp_gettimex,
 	.settime64 = pp_settime,
 	.adjfine = pp_adjfine,
 	.adjtime = pp_adjtime,
+	.enable = pp_enable,
 };
 
 static int __init pp_init(void)
