@@ -1,5 +1,9 @@
 # Cross-validating the clock against an independent PTP grandmaster
 
+> Superseded: the current instrument rides the PRU packet timestamps and reads the
+> grandmaster within ~0.5 µs; see [measurement/](measurement/). This document is the
+> CPTS-based methodology it replaced (floor ~15 µs spread) and its results.
+
 This documents how the BeagleBone's clock is cross-validated against a separate GPS
 PTP grandmaster on the LAN: measuring their time agreement with hardware timestamps,
 without disciplining either clock to the other. Each box keeps its own GPS as the

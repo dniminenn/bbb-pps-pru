@@ -1,137 +1,67 @@
 # Userspace Daemon & Chrony Configuration
 
-## Userspace Daemon: `pru_pps_shm`
+## The reference path
 
-### How It Works
+chrony's selected PPS source is the **PHC extts channel**: `ptp_pruss` surfaces each
+eCAP capture as a PTP external timestamp, and chrony pairs it with its own
+PHC-to-system model. No userspace clock model sits in that path
+([architecture](architecture.md)).
 
-1. **Opens `/dev/rpmsg_pru30`**: sends a setup byte to register its endpoint with the PRU
-2. **`/dev/mem` mmap**: maps PRU DRAM0 (`0x4A300000`) and IEP registers (`0x4A32E000`)
-3. **Blocks on `poll()`**: waits for the PRU to send an rpmsg notification on each PPS edge (2 s timeout)
-4. **IEP-wall calibration**: takes 10 back-to-back `clock_gettime(CLOCK_REALTIME)` + IEP read samples, keeps the tightest bracket to get the most accurate mapping between IEP ticks and wall time
-5. **ns/tick estimation**: uses consecutive IEP deltas (should be ~200,011,500 ticks per second at ~5 ns/tick) with a 0.9/0.1 IIR filter
-6. **Projects PPS wall time**: `pps_wall_ns = cal_wall + (pps_iep - cal_iep) * ns_per_tick`
-7. **Writes NTP SHM**: using mode-1 count handshake (odd while writing, even when done)
+```
+# GPS coarse time via gpsd/SHM unit 0: second numbering only
+refclock SHM 0 refid GPS precision 1e-1 delay 0.3 poll 2 trust noselect
 
-This blocking approach uses zero CPU between PPS pulses, compared to the ~20,000 wakeups/s a polling loop would require.
+# legacy daemon feed, kept as a comparison witness
+refclock SHM 2 refid SHMP precision 1e-9 poll 1 noselect pps lock GPS offset -0.0000047
 
-### SHM Struct Layout
+# the real reference: hardware PPS capture read off the PHC
+refclock PHC /dev/ptp1:extpps:pin=-1 refid PPS precision 1e-9 poll 1 prefer trust lock GPS offset -0.0000047
 
-The NTP SHM struct uses 64-bit `time_t` (Y2038-safe on this Debian Trixie system even on 32-bit ARM):
+# hardware packet timestamps from the PRU1 ring (rxcomp: trailer-to-SFD, 100 Mbit)
+hwtimestamp eth0 rxfilter all rxcomp 7.5e-6 minpoll -4 maxpoll -4 minsamples 8 maxsamples 64
 
-| Offset | Field | Notes |
-|--------|-------|-------|
-| 0 | `mode` (int32) | Set to 1 |
-| 4 | `count` (int32) | Handshake: odd=writing, even=done |
-| 8 | `clockTimeStampSec` (int64) | Rounded UTC second the pulse represents |
-| 16 | `clockTimeStampUSec` (int32) | Always 0 (PPS is on-second) |
-| 24 | `receiveTimeStampSec` (int64) | Wall time when edge was detected |
-| 32 | `receiveTimeStampUSec` (int32) | Sub-second µs |
-| 36 | `leap` (int32) | 0 |
-| 40 | `precision` (int32) | -29 (~2 ns) |
-| 56 | `clockTimeStampNSec` (uint32) | Always 0 |
-| 60 | `receiveTimeStampNSec` (uint32) | Sub-second ns |
+# DS3231 tempco correction, written by the daemon
+tempcomp /run/pps-tcxo-ppm 60 0 0 1 0
+```
 
-Chrony uses `clockTS - receiveTS` as its raw offset sample, so `receiveTimeStamp` must be the best available wall-clock estimate of the actual edge time, without rounding.
+`pin=-1` matters: chrony otherwise issues `PTP_PIN_SETFUNC`, which a pinless driver
+rejects and chronyd exits with "Could not enable external PHC timestamping".
+`lock GPS` resolves which second each pulse belongs to. `offset` is the measured
+antenna plus capture chain delay.
 
-### Full Source & Build
+## The daemon: `pru_pps_shm`
 
-- [pru_pps_shm.c](../daemon/pru_pps_shm.c)
+With chrony on extts, the daemon is the calibrator and instrument keeper:
+
+1. **Blocks on rpmsg** for each PPS capture from PRU0 (zero CPU between pulses)
+2. **Fit A** (ticks vs `CLOCK_MONOTONIC_RAW`, bracketed reads, best of three):
+   hardware-to-unsteered-timeline, 11 to 18 ns RMS
+3. **Fit B** (`REALTIME` minus `MONOTONIC_RAW`): models chrony's slewing so the SHM
+   witness sample can be projected; step detection flushes it on clock steps
+4. **qErr**: parses UBX-TIM-TP from gpsd's raw stream and subtracts the receiver's
+   per-pulse quantization error, matched by GPS week/tow (`-q 1`)
+5. **DS3231 tempco**: counts the PRU's 32 kHz snapshots, learns TCXO error vs GPS
+   per temperature bin (persisted to /var/lib), writes `/run/pps-tcxo-ppm` for
+   chrony's `tempcomp` and holds the PHC frequency through GPS outages
+6. **PHC keeper**: trims the PHC frequency to GPS (~1/min, `clock_adjtime`),
+   exports `pruss_phc_offset_ns` (PHC vs GPS at the capture, exact) for the
+   [PTP measurement](../measurement/), and Prometheus textfiles in `/run/pruts`
+7. **SHM witness**: still writes NTP SHM unit 2 (mode-1 handshake) so the old and
+   new reference paths stay comparable in `refclocks.log`
+
+Options: `-s` SHM unit, `-r` rpmsg device, `-q` qErr sign, `-o` PPS chain delay ns
+(the same constant as the refclock `offset`, default 4700).
+
+Build and services:
 
 ```bash
 gcc -O2 -Wall -o /usr/local/bin/pru_pps_shm pru_pps_shm.c -lrt -lm
+systemctl enable --now pru-pps-shm      # daemon/pru-pps-shm.service
+systemctl enable --now pruts            # kernel/pruts.service: PRU1 fw + modules + PHC at TAI
 ```
 
----
-
-## Systemd Service
-
-Create `/etc/systemd/system/pru-pps-shm.service` (or use the one provided: [`pru-pps-shm.service`](../daemon/pru-pps-shm.service)):
-
-```bash
-systemctl daemon-reload
-systemctl enable --now pru-pps-shm
-```
-
-**Note:** `remoteproc1` is PRU0 (`4a334000.pru`). `remoteproc2` is PRU1. The `ExecStartPre` sleep gives the rpmsg channel time to initialize. When the daemon starts, it writes a setup byte to `/dev/rpmsg_pru30` which tells the PRU the ARM endpoint addresses to use for notifications.
-
----
-
-## Chrony Configuration
-
-Relevant section of `/etc/chrony/chrony.conf`:
-
-```
-sched_priority 80
-
-# GPS NMEA via gpsd/SHM unit 0: used for coarse time and lock reference
-refclock SHM 0 refid GPS precision 1e-1 delay 0.4 poll 2 trust noselect
-
-# PRU PPS via SHM unit 2: primary disciplining source
-refclock SHM 2 refid PPS precision 1e-9 poll 1 prefer trust lock GPS pps
-
-makestep 0.5 -1
-maxupdateskew 100.0
-rtcsync
-rtcdevice /dev/rtc0
-```
-
-`lock GPS` tells Chrony to only use the PPS refclock when the GPS SHM refclock (unit 0) is also valid. This is essential for correct UTC second assignment. `pps` enables the PPS refclock mode.
-
----
-
-## PHC Discipline (`phc2sys`)
-
-Since the PRU driver captures the PPS sequence to discipline `CLOCK_REALTIME` via Chrony, the PTP hardware clock (e.g., the AM335x CPTS at `/dev/ptp0`) must be synchronized in software from the system clock.
-
-This is accomplished using the standard `phc2sys` daemon from the `linuxptp` package:
-
-```bash
-# Sync the CPTS PHC (/dev/ptp0) from the system clock (CLOCK_REALTIME)
-phc2sys -s CLOCK_REALTIME -c /dev/ptp0 -w
-```
-
-By running this as a systemd service along with `ptp4l`, your CPTS hardware clock will tightly track the PRU-disciplined system clock, enabling your device to act as an accurate PTP Grandmaster on your network.
-
-### Systemd Service Examples
-
-You can deploy `phc2sys` and `ptp4l` using the following systemd units.
-
-**1. `/etc/systemd/system/phc2sys.service`**
-```ini
-[Unit]
-Description=Synchronize PTP hardware clock (PHC) to system clock
-After=chronyd.service network.target ptp4l.service
-Wants=ptp4l.service
-
-[Service]
-Type=simple
-# -s: source clock (system clock)
-# -c: destination clock (CPTS hardware clock)
-# -w: wait for ptp4l to start
-ExecStart=/usr/sbin/phc2sys -s CLOCK_REALTIME -c /dev/ptp0 -w
-Restart=on-failure
-RestartSec=5
-
-[Install]
-WantedBy=multi-user.target
-```
-
-**2. `/etc/systemd/system/ptp4l.service`**
-```ini
-[Unit]
-Description=Precision Time Protocol (PTP) Grandmaster service
-After=network.target
-
-[Service]
-Type=simple
-# -i eth0: bind to your network interface
-# -m: print messages to stdout/syslog
-ExecStart=/usr/sbin/ptp4l -i eth0 -m
-Restart=on-failure
-RestartSec=5
-
-[Install]
-WantedBy=multi-user.target
-```
+`pru-pps-shm.service` boots PRU0 via remoteproc1 and runs the daemon SCHED_FIFO.
+`pruts.service` waits out the remoteproc2 boot race, loads the pktts firmware,
+inserts `ptp_pruss` + `cpsw_pruts`, and places the PHC at TAI.
 
 [Next: Verification & Troubleshooting](verification.md) | [Previous: PRU Firmware](firmware.md)
