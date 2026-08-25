@@ -3,6 +3,8 @@ Description=PRU pktts hardware timestamping for cpsw
 After=network.target
 Before=chrony.service
 Requires=sys-class-remoteproc-remoteproc2.device
+# requires= propagates stops to the measurer; upholds brings it back
+Upholds=ptp4l.service
 
 [Service]
 Type=oneshot
@@ -14,8 +16,8 @@ ExecStartPre=/bin/sh -c 'echo start > /sys/class/remoteproc/remoteproc2/state'
 ExecStartPre=/bin/sleep 1
 ExecStart=/sbin/insmod /home/jr/pruts/ptp_pruss.ko
 ExecStart=/sbin/insmod /home/jr/pruts/cpsw_pruts.ko vlanif=eth0.71
-# phc to tai, stack convention
-ExecStartPost=/bin/sh -c 'for p in /sys/class/ptp/ptp*; do grep -q pruss-ecap $p/clock_name && d=/dev/$(basename $p) && phc_ctl $d set && phc_ctl $d adj 37; done'
+# phc to tai, stack convention; fail only if the pruss phc is absent
+ExecStartPost=/bin/sh -c 'for p in /sys/class/ptp/ptp*; do if grep -q pruss-ecap "$p/clock_name" 2>/dev/null; then d=/dev/$(basename "$p"); phc_ctl "$d" set && phc_ctl "$d" adj 37; exit $?; fi; done; echo "no pruss phc"; exit 1'
 ExecStop=/sbin/rmmod cpsw_pruts
 ExecStop=/sbin/rmmod ptp_pruss
 

@@ -1,13 +1,21 @@
 direction: down
 
-pru: "PRU-ICSS (edge capture)\nGPS PPS on P8_16, PRU0 polls R31\nIEP latch (200 MHz, 5 ns/tick)\nDRAM0 ring: seq, iep_lo" {
+pru0: "PRU0\neCAP PPS, 32k" {
   style.font-size: 16
 }
 
-linux: "Linux (servo / policy)\npru_pps_shm (SCHED_FIFO:50)\nIEP to wall cal, ns/tick IIR\nNTP SHM 2 to chrony, adjtimex" {
+pru1: "PRU1\nframe stamps" {
   style.font-size: 16
 }
 
-pru -> linux: "/dev/mem mmap" {
-  style.font-size: 14
+kernel: "ptp_pruss + cpsw_pruts\nPHC, extts, stamps" {
+  style.font-size: 16
 }
+
+chrony: "chrony\nextts servo, hw NTP" {
+  style.font-size: 16
+}
+
+pru0 -> kernel
+pru1 -> kernel
+kernel -> chrony

@@ -3,19 +3,22 @@
 Internal precision (how tightly the box holds its own PPS) and external accuracy
 (what independent observers measure) are different claims; both are below.
 
-## Current numbers
+## Measured (2026-08-25)
 
 | Metric | Value |
 |--------|-------|
 | Fit A residuals (ticks vs raw timeline) | 11 to 18 ns RMS |
-| chrony tracking RMS vs PPS | 30 to 70 ns |
+| chrony tracking RMS vs PPS | 64 ns |
+| Served NTP, 1 h gated mean, observer A / B | -126 / -152 ns |
+| Served NTP, 1 h gated p95 | 393 / 449 ns |
+| Served NTP, 1 h gated stddev | 548 / 289 ns |
 | extts refclock through 90 s of 100% CPU | 88 ns RMS, max 424 ns |
-| Served NTP vs two hw-timestamped observers | ~100 ns median, 1 h p95 < 400 ns |
-| PTP cross-check of the LAN grandmaster | agreement within ~0.5 µs |
+| PTP read of the elected grandmaster | within ~0.5 µs |
 
-The served-time figures come from delay-gated, interleaved, hardware-timestamped NTP
-measurements taken by two independent GPS-disciplined observers; the box is never
-graded by its own telemetry alone.
+The served-time rows are ntpqual measurements: hardware-timestamped interleaved NTP,
+delay-gated, taken continuously by two independent GPS-disciplined observers on
+separate switches. The two observers agree with each other at the 25 ns level, which
+bounds the measurement itself; the box is never graded by its own telemetry alone.
 
 ## Interpreting daemon output
 

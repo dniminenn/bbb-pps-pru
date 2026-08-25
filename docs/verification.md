@@ -83,9 +83,9 @@ for the daemon. Deploy order matters because chrony and the daemon hold the PHC 
 the daemon holds rpmsg:
 
 ```bash
-systemctl stop ptp-prom ptp4l pru-pps-shm chrony
+systemctl stop ptp4l pru-pps-shm chrony
 systemctl restart pruts        # rmmod/insmod + PRU1 fw + PHC at TAI
-systemctl start chrony pru-pps-shm ptp4l ptp-prom
+systemctl start chrony pru-pps-shm ptp4l
 ```
 
 On this kernel, runtime remoteproc stop/bind writes are silently ignored, so **new

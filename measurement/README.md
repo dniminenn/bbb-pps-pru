@@ -6,14 +6,17 @@ PTP and without touching any clock.
 - `ptp4l.service` runs ptp4l as a free-running, client-only instance on the
   pruss PHC. The PRU stamps every frame on the wire, so PTP event messages get
   the same hardware timestamps NTP serving uses. Nothing is disciplined.
-- `ptp-prom` + `ptp-prom.service` poll ptp4l over its UDS and publish
-  `ptp_offset_from_master_ns` and `ptp_mean_path_delay_ns` into the pruts
-  textfile dir for node_exporter.
 - `pru_pps_shm` exports `pruss_phc_offset_ns`, the PHC's error against GPS
-  (TAI), anchored to the hardware PPS capture. The grandmaster's error against
-  this box's GPS is then simply:
+  (TAI), anchored to the hardware PPS capture. Pair it with ptp4l's
+  offsetFromMaster (pmc `GET CURRENT_DATA_SET`, medianed over a window since a
+  queued sync can read tens of µs out on its own) and the grandmaster's error
+  against this box's GPS is simply:
 
-      gm_minus_gps = pruss_phc_offset_ns - ptp_offset_from_master_ns
+      gm_minus_gps = pruss_phc_offset_ns - offsetFromMaster
+
+  correcting for the PHC's residual rate (`pruss_phc_freq_ppb`) over the gap
+  between the anchor pulse and the sync. How that lands in a metrics system is
+  deployment plumbing and stays out of this repo.
 
 Both grandmasters sit in PTP domain 0, so BMCA elects one and that is the one
 measured, the same time any PTP consumer on this LAN would receive. The `gm`
